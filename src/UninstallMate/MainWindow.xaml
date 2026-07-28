@@ -1,0 +1,428 @@
+<ui:FluentWindow x:Class="UninstallMate.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:ui="http://schemas.lepo.co/wpfui/2022/xaml"
+        xmlns:converters="clr-namespace:UninstallMate.Converters"
+        Title="UninstallMate" Width="1320" Height="820" MinWidth="1080" MinHeight="680"
+        WindowStartupLocation="CenterScreen" ResizeMode="CanResize"
+        ExtendsContentIntoTitleBar="True" WindowBackdropType="Acrylic"
+        Background="Transparent"
+        Foreground="{DynamicResource TextFillColorPrimaryBrush}">
+
+  <ui:FluentWindow.Resources>
+    <converters:ApplicationIconConverter x:Key="ApplicationIconConverter" />
+    <BooleanToVisibilityConverter x:Key="BooleanToVisibilityConverter" />
+    <SolidColorBrush x:Key="WindowTintBrush" Color="#D90B121C" />
+    <SolidColorBrush x:Key="NavigationSurfaceBrush" Color="#E6121C28" />
+    <SolidColorBrush x:Key="PanelSurfaceBrush" Color="#F0182431" />
+    <SolidColorBrush x:Key="ControlSurfaceBrush" Color="#E6212E3D" />
+    <SolidColorBrush x:Key="ControlHoverBrush" Color="#F02B3B4C" />
+    <SolidColorBrush x:Key="SelectedSurfaceBrush" Color="#F01B4565" />
+    <SolidColorBrush x:Key="SelectedStrokeBrush" Color="#FF60CDFF" />
+    <Style x:Key="MetaLabel" TargetType="TextBlock">
+      <Setter Property="Foreground" Value="{DynamicResource TextFillColorSecondaryBrush}" />
+      <Setter Property="FontSize" Value="11" />
+      <Setter Property="FontWeight" Value="SemiBold" />
+      <Setter Property="Margin" Value="0,0,0,4" />
+    </Style>
+
+    <Style x:Key="SettingsListItem" TargetType="ListViewItem">
+      <Setter Property="HorizontalContentAlignment" Value="Stretch" />
+      <Setter Property="VerticalContentAlignment" Value="Center" />
+      <Setter Property="Background" Value="Transparent" />
+      <Setter Property="BorderThickness" Value="0" />
+      <Setter Property="Padding" Value="0" />
+      <Setter Property="Margin" Value="0,0,0,7" />
+      <Setter Property="FocusVisualStyle" Value="{x:Null}" />
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="ListViewItem">
+            <Border x:Name="Surface" Background="{StaticResource ControlSurfaceBrush}"
+                    BorderBrush="{DynamicResource CardStrokeColorDefaultBrush}" BorderThickness="1"
+                    CornerRadius="8" SnapsToDevicePixels="True">
+              <Border.RenderTransform><TranslateTransform X="0" /></Border.RenderTransform>
+              <Grid>
+                <Border x:Name="SelectionRail" Width="3" CornerRadius="2"
+                        Background="{DynamicResource AccentFillColorDefaultBrush}"
+                        HorizontalAlignment="Left" Margin="3,10" Opacity="0" />
+                <ContentPresenter Margin="13,11,12,11" />
+              </Grid>
+            </Border>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsMouseOver" Value="True">
+                <Setter TargetName="Surface" Property="Background" Value="{StaticResource ControlHoverBrush}" />
+              </Trigger>
+              <Trigger Property="IsSelected" Value="True">
+                <Setter TargetName="Surface" Property="Background" Value="{StaticResource SelectedSurfaceBrush}" />
+                <Setter TargetName="Surface" Property="BorderBrush" Value="{StaticResource SelectedStrokeBrush}" />
+                <Setter TargetName="SelectionRail" Property="Opacity" Value="1" />
+              </Trigger>
+              <EventTrigger RoutedEvent="MouseEnter">
+                <BeginStoryboard>
+                  <Storyboard>
+                    <DoubleAnimation Storyboard.TargetName="Surface"
+                                     Storyboard.TargetProperty="(UIElement.RenderTransform).(TranslateTransform.X)"
+                                     To="3" Duration="0:0:0.12" />
+                  </Storyboard>
+                </BeginStoryboard>
+              </EventTrigger>
+              <EventTrigger RoutedEvent="MouseLeave">
+                <BeginStoryboard>
+                  <Storyboard>
+                    <DoubleAnimation Storyboard.TargetName="Surface"
+                                     Storyboard.TargetProperty="(UIElement.RenderTransform).(TranslateTransform.X)"
+                                     To="0" Duration="0:0:0.16" />
+                  </Storyboard>
+                </BeginStoryboard>
+              </EventTrigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+
+    <Style TargetType="DataGrid" BasedOn="{StaticResource {x:Type DataGrid}}">
+      <Setter Property="Background" Value="Transparent" />
+      <Setter Property="Foreground" Value="{DynamicResource TextFillColorPrimaryBrush}" />
+      <Setter Property="BorderThickness" Value="0" />
+      <Setter Property="GridLinesVisibility" Value="Horizontal" />
+      <Setter Property="HorizontalGridLinesBrush" Value="{DynamicResource DividerStrokeColorDefaultBrush}" />
+      <Setter Property="VerticalGridLinesBrush" Value="Transparent" />
+      <Setter Property="HeadersVisibility" Value="Column" />
+      <Setter Property="RowBackground" Value="Transparent" />
+      <Setter Property="RowHeight" Value="42" />
+      <Setter Property="ColumnHeaderHeight" Value="34" />
+      <Setter Property="CanUserAddRows" Value="False" />
+      <Setter Property="CanUserDeleteRows" Value="False" />
+      <Setter Property="CanUserResizeRows" Value="False" />
+      <Setter Property="AutoGenerateColumns" Value="False" />
+      <Setter Property="ScrollViewer.CanContentScroll" Value="True" />
+    </Style>
+    <Style TargetType="DataGridColumnHeader" BasedOn="{StaticResource {x:Type DataGridColumnHeader}}">
+      <Setter Property="Background" Value="{DynamicResource LayerFillColorDefaultBrush}" />
+      <Setter Property="Foreground" Value="{DynamicResource TextFillColorSecondaryBrush}" />
+      <Setter Property="BorderBrush" Value="{DynamicResource DividerStrokeColorDefaultBrush}" />
+      <Setter Property="BorderThickness" Value="0,0,0,1" />
+      <Setter Property="Padding" Value="10,0" />
+      <Setter Property="FontSize" Value="10" />
+      <Setter Property="FontWeight" Value="SemiBold" />
+    </Style>
+    <Style TargetType="DataGridCell" BasedOn="{StaticResource {x:Type DataGridCell}}">
+      <Setter Property="BorderThickness" Value="0" />
+      <Setter Property="Padding" Value="10,5" />
+      <Setter Property="VerticalContentAlignment" Value="Center" />
+      <Setter Property="FocusVisualStyle" Value="{x:Null}" />
+    </Style>
+  </ui:FluentWindow.Resources>
+
+  <Grid Background="{StaticResource WindowTintBrush}">
+    <Grid.RowDefinitions><RowDefinition Height="48" /><RowDefinition Height="*" /></Grid.RowDefinitions>
+
+    <ui:TitleBar Grid.Row="0" Title="" Height="48" ForceShutdown="True">
+      <ui:TitleBar.Header>
+        <StackPanel Orientation="Horizontal">
+          <Border Width="26" Height="26" CornerRadius="7" Background="{DynamicResource AccentFillColorDefaultBrush}" Margin="0,0,9,0">
+            <TextBlock Text="U" Foreground="{DynamicResource TextOnAccentFillColorPrimaryBrush}" FontSize="14" FontWeight="Bold"
+                       HorizontalAlignment="Center" VerticalAlignment="Center" />
+          </Border>
+          <TextBlock Text="UninstallMate" FontSize="13" FontWeight="SemiBold" VerticalAlignment="Center" />
+        </StackPanel>
+      </ui:TitleBar.Header>
+    </ui:TitleBar>
+
+    <Grid Grid.Row="1">
+      <Grid.ColumnDefinitions><ColumnDefinition Width="Auto" /><ColumnDefinition Width="*" /></Grid.ColumnDefinitions>
+
+      <Border x:Name="NavigationPane" Width="240"
+              Background="{StaticResource NavigationSurfaceBrush}"
+              BorderBrush="{DynamicResource DividerStrokeColorDefaultBrush}" BorderThickness="0,0,1,0"
+              Padding="12,18,12,14">
+        <Grid>
+          <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" /><RowDefinition Height="Auto" /><RowDefinition Height="Auto" />
+            <RowDefinition Height="*" /><RowDefinition Height="Auto" />
+          </Grid.RowDefinitions>
+
+          <StackPanel Margin="8,0,8,22">
+            <TextBlock x:Name="NavProductName" Text="UninstallMate" FontSize="19" FontWeight="SemiBold" />
+            <TextBlock x:Name="NavSubtitle" Text="Apps &amp; cleanup" Foreground="{DynamicResource TextFillColorSecondaryBrush}" Margin="0,3,0,0" />
+          </StackPanel>
+
+          <Border Grid.Row="1" Background="{DynamicResource AccentFillColorTertiaryBrush}" CornerRadius="6" Padding="11,10" Margin="0,0,0,6">
+            <Grid>
+              <Grid.ColumnDefinitions><ColumnDefinition Width="26" /><ColumnDefinition Width="*" /></Grid.ColumnDefinitions>
+              <ui:SymbolIcon Symbol="Delete24" Foreground="{DynamicResource TextFillColorPrimaryBrush}" />
+              <TextBlock x:Name="NavInstalledLabel" Grid.Column="1" Text="Installed apps" FontWeight="SemiBold" Margin="9,0,0,0" VerticalAlignment="Center" />
+            </Grid>
+          </Border>
+
+          <Border Grid.Row="2" Background="{StaticResource ControlSurfaceBrush}"
+                  BorderBrush="{DynamicResource ControlStrokeColorDefaultBrush}" BorderThickness="1"
+                  CornerRadius="7" Padding="10" Margin="0,12,0,0">
+            <StackPanel>
+              <TextBlock Text="UNINSTALL OPTIONS" Style="{StaticResource MetaLabel}" Margin="2,0,0,10" />
+              <CheckBox Content="Quiet uninstall" IsChecked="{Binding QuietUninstall}"
+                        ToolTip="Ask the registered uninstaller to run quietly when it supports this" Margin="0,0,0,10" />
+              <CheckBox Content="Restore point" IsChecked="{Binding CreateRestorePoint}"
+                        ToolTip="Ask Windows to create a restore point before uninstall or cleanup" Margin="0,0,0,10" />
+              <CheckBox Content="Recovery backup" IsChecked="{Binding PreserveCleanupBackups}"
+                        ToolTip="Keep recoverable copies of removed files and system definitions" />
+              <TextBlock Text="Off by default."
+                         Foreground="{DynamicResource TextFillColorTertiaryBrush}" FontSize="10"
+                         TextWrapping="Wrap" Margin="2,10,0,0" />
+            </StackPanel>
+          </Border>
+
+          <StackPanel Grid.Row="3" VerticalAlignment="Bottom">
+            <TextBlock Text="RECOVERY" Style="{StaticResource MetaLabel}" Margin="3,0,0,7" />
+            <ui:Button Appearance="Secondary" Icon="{ui:SymbolIcon Broom24}" Command="{Binding OpenQuarantineCommand}"
+                       HorizontalContentAlignment="Left" Margin="0,0,0,6" Padding="10,8">
+              <TextBlock x:Name="NavRecoveryLabel" Text="Open quarantine" Margin="8,0,0,0" />
+            </ui:Button>
+            <ui:Button Appearance="Secondary" Icon="{ui:SymbolIcon ArrowSync24}" Command="{Binding RestoreQuarantineCommand}"
+                       HorizontalContentAlignment="Left" Padding="10,8">
+              <TextBlock x:Name="NavRestoreLabel" Text="Restore last cleanup" Margin="8,0,0,0" />
+            </ui:Button>
+            <TextBlock Text="{Binding RecoveryStatusText}" Foreground="{DynamicResource TextFillColorTertiaryBrush}"
+                       FontSize="10" Margin="3,7,0,0" TextWrapping="Wrap" />
+          </StackPanel>
+
+          <Border x:Name="NavVersionPanel" Grid.Row="4" Background="{DynamicResource ControlFillColorDefaultBrush}"
+                  BorderBrush="{DynamicResource ControlStrokeColorDefaultBrush}" BorderThickness="1"
+                  CornerRadius="6" Padding="10,8" Margin="0,18,0,0">
+            <Grid>
+              <TextBlock Text="Version" Foreground="{DynamicResource TextFillColorSecondaryBrush}" />
+              <TextBlock Text="1.6.0" HorizontalAlignment="Right" FontWeight="SemiBold" />
+            </Grid>
+          </Border>
+        </Grid>
+      </Border>
+
+      <Grid Grid.Column="1" Margin="24,18,24,16">
+        <Grid.RowDefinitions><RowDefinition Height="Auto" /><RowDefinition Height="*" /><RowDefinition Height="Auto" /></Grid.RowDefinitions>
+
+        <Grid Margin="0,0,0,16">
+          <Grid.ColumnDefinitions><ColumnDefinition /><ColumnDefinition Width="Auto" /></Grid.ColumnDefinitions>
+          <StackPanel>
+            <TextBlock Text="Installed apps" FontSize="28" FontWeight="SemiBold" />
+            <TextBlock Text="Choose an app to uninstall, then review its remaining files and registrations."
+                       Foreground="{DynamicResource TextFillColorSecondaryBrush}" Margin="0,4,0,0" />
+          </StackPanel>
+          <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
+            <ui:Button Appearance="Secondary" Icon="{ui:SymbolIcon ArrowExportUp24}" Content="Export"
+                       Command="{Binding ExportCommand}" Margin="0,0,8,0" />
+            <ui:Button Appearance="Primary" Icon="{ui:SymbolIcon ArrowSync24}" Content="Refresh"
+                       Command="{Binding RefreshCommand}" />
+          </StackPanel>
+        </Grid>
+
+        <Grid Grid.Row="1">
+          <Grid.ColumnDefinitions><ColumnDefinition Width="*" MinWidth="340" /><ColumnDefinition Width="16" /><ColumnDefinition Width="*" MinWidth="340" /></Grid.ColumnDefinitions>
+
+          <Grid>
+            <Grid.RowDefinitions><RowDefinition Height="Auto" /><RowDefinition Height="*" /></Grid.RowDefinitions>
+            <ui:Card Padding="12" Margin="0,0,0,12" Background="{StaticResource PanelSurfaceBrush}">
+              <Grid>
+                <Grid.RowDefinitions><RowDefinition Height="Auto" /><RowDefinition Height="Auto" /></Grid.RowDefinitions>
+                <ui:TextBox Text="{Binding SearchText, UpdateSourceTrigger=PropertyChanged}"
+                            PlaceholderText="Search installed apps"
+                            Icon="{ui:SymbolIcon Search24}" />
+                <Grid Grid.Row="1" Margin="2,11,2,0">
+                  <ui:ToggleSwitch Content="Show system components" IsChecked="{Binding IncludeSystem}"
+                                   ToolTip="Show runtimes, drivers, inbox packages, and hardware support components" />
+                  <Border Background="{DynamicResource ControlFillColorDefaultBrush}"
+                          BorderBrush="{DynamicResource ControlStrokeColorDefaultBrush}" BorderThickness="1"
+                          CornerRadius="6" Padding="9,4" HorizontalAlignment="Right" VerticalAlignment="Center">
+                    <TextBlock Text="{Binding VisibleCountText}" Foreground="{DynamicResource TextFillColorSecondaryBrush}" FontSize="11" />
+                  </Border>
+                </Grid>
+              </Grid>
+            </ui:Card>
+
+            <ListView x:Name="ApplicationsList" Grid.Row="1" ItemsSource="{Binding ApplicationsView}"
+                      SelectedItem="{Binding SelectedApp}" ItemContainerStyle="{StaticResource SettingsListItem}"
+                      Background="Transparent" BorderThickness="0" Padding="0,1,7,0"
+                      ScrollViewer.HorizontalScrollBarVisibility="Disabled"
+                      VirtualizingPanel.IsVirtualizing="True" VirtualizingPanel.VirtualizationMode="Recycling"
+                      SelectionChanged="ApplicationSelectionChanged">
+              <ListView.ItemTemplate>
+                <DataTemplate>
+                  <Grid>
+                    <Grid.ColumnDefinitions><ColumnDefinition Width="42" /><ColumnDefinition Width="*" /><ColumnDefinition Width="Auto" /></Grid.ColumnDefinitions>
+                    <Border Width="36" Height="36" CornerRadius="7" Background="{DynamicResource AccentFillColorTertiaryBrush}" VerticalAlignment="Center">
+                      <Grid>
+                        <TextBlock Text="{Binding DisplayInitial}" Foreground="{DynamicResource TextFillColorPrimaryBrush}"
+                                   FontSize="15" FontWeight="SemiBold" HorizontalAlignment="Center" VerticalAlignment="Center" />
+                        <Image Source="{Binding DisplayIconPath, Converter={StaticResource ApplicationIconConverter}}"
+                               Width="30" Height="30" Stretch="Uniform" />
+                      </Grid>
+                    </Border>
+                    <StackPanel Grid.Column="1" Margin="9,0,12,0" VerticalAlignment="Center">
+                      <TextBlock Text="{Binding DisplayName}" FontSize="14" FontWeight="SemiBold" TextTrimming="CharacterEllipsis" />
+                      <TextBlock Text="{Binding Publisher}" FontSize="11" Foreground="{DynamicResource TextFillColorSecondaryBrush}"
+                                 TextTrimming="CharacterEllipsis" Margin="0,3,0,0" />
+                    </StackPanel>
+                    <StackPanel Grid.Column="2" Orientation="Horizontal" VerticalAlignment="Center">
+                      <StackPanel Margin="0,0,13,0">
+                        <TextBlock Text="{Binding Version}" FontSize="11" HorizontalAlignment="Right" />
+                        <TextBlock Text="{Binding SizeText}" FontSize="10" Foreground="{DynamicResource TextFillColorSecondaryBrush}"
+                                   HorizontalAlignment="Right" Margin="0,3,0,0" />
+                      </StackPanel>
+                      <TextBlock Text="›" FontSize="22" Foreground="{DynamicResource TextFillColorSecondaryBrush}" VerticalAlignment="Center" />
+                    </StackPanel>
+                  </Grid>
+                </DataTemplate>
+              </ListView.ItemTemplate>
+            </ListView>
+          </Grid>
+
+          <ui:Card x:Name="DetailsPanel" Grid.Column="2" Padding="18" VerticalAlignment="Stretch"
+                   Background="{StaticResource PanelSurfaceBrush}">
+            <ui:Card.RenderTransform><TranslateTransform X="0" /></ui:Card.RenderTransform>
+            <Grid>
+              <TextBlock Text="Select an Application" FontSize="22" FontWeight="SemiBold"
+                         Foreground="{DynamicResource TextFillColorSecondaryBrush}"
+                         HorizontalAlignment="Center" VerticalAlignment="Center"
+                         Visibility="{Binding HasNoSelection, Converter={StaticResource BooleanToVisibilityConverter}}" />
+
+              <Grid Visibility="{Binding HasSelection, Converter={StaticResource BooleanToVisibilityConverter}}">
+                <Grid.RowDefinitions>
+                  <RowDefinition Height="Auto" /><RowDefinition Height="Auto" /><RowDefinition Height="Auto" />
+                  <RowDefinition Height="Auto" /><RowDefinition Height="Auto" /><RowDefinition Height="*" /><RowDefinition Height="Auto" />
+                </Grid.RowDefinitions>
+
+                <Grid>
+                <Grid.ColumnDefinitions><ColumnDefinition Width="46" /><ColumnDefinition Width="*" /><ColumnDefinition Width="Auto" /></Grid.ColumnDefinitions>
+                <Border Width="40" Height="40" CornerRadius="9" Background="{DynamicResource AccentFillColorTertiaryBrush}">
+                  <Grid>
+                    <TextBlock Text="{Binding SelectedApp.DisplayInitial}" Foreground="{DynamicResource TextFillColorPrimaryBrush}"
+                               FontSize="18" FontWeight="SemiBold" HorizontalAlignment="Center" VerticalAlignment="Center" />
+                    <Image Source="{Binding SelectedApp.DisplayIconPath, Converter={StaticResource ApplicationIconConverter}}"
+                           Width="34" Height="34" Stretch="Uniform" />
+                  </Grid>
+                </Border>
+                <StackPanel Grid.Column="1" Margin="10,0,10,0" VerticalAlignment="Center">
+                  <TextBlock Text="{Binding SelectedApp.DisplayName}" FontSize="19" FontWeight="SemiBold" TextTrimming="CharacterEllipsis" />
+                  <TextBlock Text="{Binding SelectedApp.Publisher}" Foreground="{DynamicResource TextFillColorSecondaryBrush}" TextTrimming="CharacterEllipsis" />
+                </StackPanel>
+                <Border Grid.Column="2" Background="{DynamicResource AccentFillColorTertiaryBrush}" CornerRadius="6" Padding="8,4" VerticalAlignment="Center">
+                  <TextBlock Text="{Binding SelectedApp.SourceText}" Foreground="{DynamicResource TextFillColorPrimaryBrush}" FontSize="10" />
+                </Border>
+              </Grid>
+
+              <Grid Grid.Row="1" Margin="0,16,0,14" IsEnabled="{Binding HasSelection}">
+                <Grid.ColumnDefinitions><ColumnDefinition /><ColumnDefinition /><ColumnDefinition /><ColumnDefinition /></Grid.ColumnDefinitions>
+                <StackPanel><TextBlock Style="{StaticResource MetaLabel}" Text="VERSION" /><TextBlock Text="{Binding SelectedApp.Version}" TextTrimming="CharacterEllipsis" /></StackPanel>
+                <StackPanel Grid.Column="1"><TextBlock Style="{StaticResource MetaLabel}" Text="SIZE" /><TextBlock Text="{Binding SelectedApp.SizeText}" /></StackPanel>
+                <StackPanel Grid.Column="2"><TextBlock Style="{StaticResource MetaLabel}" Text="SCOPE" /><TextBlock Text="{Binding SelectedApp.Scope}" /></StackPanel>
+                <StackPanel Grid.Column="3"><TextBlock Style="{StaticResource MetaLabel}" Text="ARCH" /><TextBlock Text="{Binding SelectedApp.Architecture}" /></StackPanel>
+              </Grid>
+
+              <Border Grid.Row="2" Background="{DynamicResource ControlFillColorDefaultBrush}"
+                      BorderBrush="{DynamicResource ControlStrokeColorDefaultBrush}" BorderThickness="1"
+                      CornerRadius="8" Padding="12" Margin="0,0,0,12" IsEnabled="{Binding HasSelection}">
+                <StackPanel>
+                  <TextBlock Style="{StaticResource MetaLabel}" Text="INSTALL LOCATION" />
+                  <TextBlock Text="{Binding SelectedApp.InstallLocation}" Foreground="{DynamicResource TextFillColorSecondaryBrush}"
+                             TextTrimming="CharacterEllipsis" ToolTip="{Binding SelectedApp.InstallLocation}" />
+                </StackPanel>
+              </Border>
+
+                <ui:Button Grid.Row="3" Appearance="Primary" Icon="{ui:SymbolIcon Delete24}" Content="Uninstall app"
+                           Command="{Binding UninstallCommand}" HorizontalAlignment="Left" Margin="0,0,0,15" />
+
+                <Grid Grid.Row="4" Margin="0,0,0,9"
+                    Visibility="{Binding IsCleanupReviewVisible, Converter={StaticResource BooleanToVisibilityConverter}}">
+                <TextBlock Text="LEFTOVER REVIEW" Style="{StaticResource MetaLabel}" VerticalAlignment="Center" />
+                <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+                  <ui:Button Appearance="Secondary" Padding="8,4" FontSize="10" Content="Safe" Command="{Binding SelectSafeCommand}" Margin="0,0,5,0" />
+                  <ui:Button Appearance="Secondary" Padding="8,4" FontSize="10" Content="All" Command="{Binding SelectAllCommand}" Margin="0,0,5,0" />
+                  <ui:Button Appearance="Secondary" Padding="8,4" FontSize="10" Content="Clear" Command="{Binding ClearSelectionCommand}" />
+                </StackPanel>
+              </Grid>
+
+                <TabControl Grid.Row="5"
+                          Visibility="{Binding IsCleanupReviewVisible, Converter={StaticResource BooleanToVisibilityConverter}}">
+                <TabItem Header="{Binding ApplicationCleanupCountText}">
+                  <Grid>
+                    <Grid.RowDefinitions><RowDefinition Height="Auto" /><RowDefinition Height="*" /></Grid.RowDefinitions>
+                    <ui:InfoBar Title="Application files" Message="All detected items are selected. Uncheck anything you want to keep."
+                                Severity="Informational" IsOpen="True" IsClosable="False" Margin="0,0,0,7" />
+                    <Border Grid.Row="1" Background="{DynamicResource LayerFillColorDefaultBrush}" BorderBrush="{DynamicResource CardStrokeColorDefaultBrush}"
+                            BorderThickness="1" CornerRadius="7" ClipToBounds="True">
+                      <DataGrid ItemsSource="{Binding ApplicationCleanupCandidates}">
+                        <DataGrid.Columns>
+                          <DataGridCheckBoxColumn Header="" Binding="{Binding IsSelected, UpdateSourceTrigger=PropertyChanged}" Width="36" />
+                          <DataGridTextColumn Header="ITEM" Binding="{Binding DisplayTarget}" Width="*" IsReadOnly="True" />
+                          <DataGridTextColumn Header="RISK" Binding="{Binding Risk}" Width="55" IsReadOnly="True" />
+                        </DataGrid.Columns>
+                      </DataGrid>
+                    </Border>
+                  </Grid>
+                </TabItem>
+                <TabItem Header="{Binding UserCleanupCountText}">
+                  <Grid>
+                    <Grid.RowDefinitions><RowDefinition Height="Auto" /><RowDefinition Height="*" /></Grid.RowDefinitions>
+                    <ui:InfoBar Title="User files" Message="All detected items are selected, including possible settings and personal data."
+                                Severity="Warning" IsOpen="True" IsClosable="False" Margin="0,0,0,7" />
+                    <Border Grid.Row="1" Background="{DynamicResource LayerFillColorDefaultBrush}" BorderBrush="{DynamicResource CardStrokeColorDefaultBrush}"
+                            BorderThickness="1" CornerRadius="7" ClipToBounds="True">
+                      <DataGrid ItemsSource="{Binding UserCleanupCandidates}">
+                        <DataGrid.Columns>
+                          <DataGridCheckBoxColumn Header="" Binding="{Binding IsSelected, UpdateSourceTrigger=PropertyChanged}" Width="36" />
+                          <DataGridTextColumn Header="ITEM" Binding="{Binding DisplayTarget}" Width="*" IsReadOnly="True" />
+                          <DataGridTextColumn Header="RISK" Binding="{Binding Risk}" Width="55" IsReadOnly="True" />
+                        </DataGrid.Columns>
+                      </DataGrid>
+                    </Border>
+                  </Grid>
+                </TabItem>
+                <TabItem Header="{Binding SystemCleanupCountText}">
+                  <Grid>
+                    <Grid.RowDefinitions><RowDefinition Height="Auto" /><RowDefinition Height="*" /></Grid.RowDefinitions>
+                    <ui:InfoBar Title="System files" Message="All detected registrations and services are selected. Review carefully."
+                                Severity="Warning" IsOpen="True" IsClosable="False" Margin="0,0,0,7" />
+                    <Border Grid.Row="1" Background="{DynamicResource LayerFillColorDefaultBrush}" BorderBrush="{DynamicResource SystemFillColorCautionBrush}"
+                            BorderThickness="1" CornerRadius="7" ClipToBounds="True">
+                      <DataGrid ItemsSource="{Binding SystemCleanupCandidates}">
+                        <DataGrid.Columns>
+                          <DataGridCheckBoxColumn Header="" Binding="{Binding IsSelected, UpdateSourceTrigger=PropertyChanged}" Width="36" />
+                          <DataGridTextColumn Header="ITEM" Binding="{Binding DisplayTarget}" Width="*" IsReadOnly="True" />
+                          <DataGridTextColumn Header="RISK" Binding="{Binding Risk}" Width="55" IsReadOnly="True" />
+                        </DataGrid.Columns>
+                      </DataGrid>
+                    </Border>
+                  </Grid>
+                </TabItem>
+              </TabControl>
+
+                <Grid Grid.Row="6" Margin="0,12,0,0"
+                    Visibility="{Binding IsCleanupReviewVisible, Converter={StaticResource BooleanToVisibilityConverter}}">
+                <StackPanel VerticalAlignment="Center">
+                  <TextBlock Text="{Binding SelectedCleanupText}" Foreground="{DynamicResource TextFillColorSecondaryBrush}" FontSize="11" />
+                  <TextBlock Text="Only selected items are changed" Foreground="{DynamicResource TextFillColorTertiaryBrush}" FontSize="9" />
+                </StackPanel>
+                <ui:Button Appearance="Primary" Icon="{ui:SymbolIcon Broom24}" Content="{Binding CleanupActionLabel}"
+                           Command="{Binding CleanCommand}" HorizontalAlignment="Right" />
+                </Grid>
+              </Grid>
+            </Grid>
+          </ui:Card>
+        </Grid>
+
+        <Border Grid.Row="2" Background="{StaticResource PanelSurfaceBrush}"
+                BorderBrush="{DynamicResource ControlStrokeColorDefaultBrush}" BorderThickness="1"
+                CornerRadius="7" Padding="10,7" Margin="0,13,0,0">
+          <Grid>
+            <Grid.ColumnDefinitions><ColumnDefinition Width="90" /><ColumnDefinition /><ColumnDefinition Width="Auto" /></Grid.ColumnDefinitions>
+            <ProgressBar IsIndeterminate="{Binding IsBusy}" VerticalAlignment="Center" Margin="0,0,12,0" Height="3" />
+            <TextBlock Grid.Column="1" Text="{Binding Status}" Foreground="{DynamicResource TextFillColorSecondaryBrush}"
+                       TextTrimming="CharacterEllipsis" VerticalAlignment="Center" FontSize="11" />
+            <ui:Button Grid.Column="2" Appearance="Secondary" Padding="9,4" FontSize="10" Content="Cancel"
+                       Command="{Binding CancelCommand}" />
+          </Grid>
+        </Border>
+      </Grid>
+    </Grid>
+  </Grid>
+</ui:FluentWindow>

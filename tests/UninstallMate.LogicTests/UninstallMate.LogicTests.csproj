@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <NoWarn>$(NoWarn);CA1416</NoWarn>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="Program.cs" />
+    <Compile Include="..\..\src\UninstallMate\Infrastructure\ObservableObject.cs" Link="ObservableObject.cs" />
+    <Compile Include="..\..\src\UninstallMate\Models\InstalledApplication.cs" Link="InstalledApplication.cs" />
+    <Compile Include="..\..\src\UninstallMate\Models\CleanupCandidate.cs" Link="CleanupCandidate.cs" />
+    <Compile Include="..\..\src\UninstallMate\Models\OperationResult.cs" Link="OperationResult.cs" />
+    <Compile Include="..\..\src\UninstallMate\Services\CommandLineParser.cs" Link="CommandLineParser.cs" />
+    <Compile Include="..\..\src\UninstallMate\Services\AppDiscoveryService.cs" Link="AppDiscoveryService.cs" />
+    <Compile Include="..\..\src\UninstallMate\Services\CleanupScanner.cs" Link="CleanupScanner.cs" />
+    <Compile Include="..\..\src\UninstallMate\Services\CleanupService.cs" Link="CleanupService.cs" />
+    <Compile Include="..\..\src\UninstallMate\Services\QuarantineService.cs" Link="QuarantineService.cs" />
+    <Compile Include="..\..\src\UninstallMate\Services\UninstallService.cs" Link="UninstallService.cs" />
+  </ItemGroup>
+</Project>
