@@ -1,6 +1,7 @@
 using Microsoft.Win32;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
+using System.Text.Json;
 using UninstallMate.Models;
 
 namespace UninstallMate.Services.Providers;
@@ -17,6 +18,7 @@ public sealed class NativeMessagingProvider : ICleanupArtifactProvider
         var sw = Stopwatch.StartNew();
         var candidates = new List<CleanupCandidate>();
         var diagnostics = new List<ScanDiagnostic>();
+        var statusAcc = new ScanStatusAccumulator();
 
         if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
         {
@@ -27,18 +29,19 @@ public sealed class NativeMessagingProvider : ICleanupArtifactProvider
         {
             try
             {
-                ScanBrowserHosts(identity, context, candidates, diagnostics, token);
+                ScanBrowserHosts(identity, context, candidates, diagnostics, statusAcc, token);
             }
             catch (Exception ex)
             {
                 diagnostics.Add(new ScanDiagnostic(Name, $"Error during native messaging host scan: {ex.Message}", IsError: true, ExceptionDetail: ex.ToString()));
+                statusAcc.MarkFailed();
             }
         }, token);
 
         return new ProviderScanResult
         {
             ProviderName = Name,
-            Status = diagnostics.Any(d => d.IsError) ? ScanStatus.CompleteWithWarnings : ScanStatus.Complete,
+            Status = statusAcc.Status,
             Candidates = candidates,
             Diagnostics = diagnostics,
             Elapsed = sw.Elapsed
@@ -50,6 +53,7 @@ public sealed class NativeMessagingProvider : ICleanupArtifactProvider
         CleanupScanContext context,
         List<CleanupCandidate> candidates,
         List<ScanDiagnostic> diagnostics,
+        ScanStatusAccumulator statusAcc,
         CancellationToken token)
     {
         var hostPaths = new[]
@@ -82,31 +86,78 @@ public sealed class NativeMessagingProvider : ICleanupArtifactProvider
                             if (hostKey is null) continue;
 
                             var manifestPath = Convert.ToString(hostKey.GetValue(null)) ?? "";
-                            var matchesEvidence = identity.ReferencesEvidence(manifestPath);
+                            var manifestExePath = TryExtractHostExecutable(manifestPath);
+
+                            var matchesManifestPath = !string.IsNullOrEmpty(manifestPath) && identity.ReferencesEvidence(manifestPath);
+                            var matchesExePath = !string.IsNullOrEmpty(manifestExePath) && identity.ReferencesEvidence(manifestExePath);
+                            var matchesEvidence = matchesManifestPath || matchesExePath;
                             var matchesName = identity.CandidateNames.Any(c => c.Equals(hostName, StringComparison.OrdinalIgnoreCase));
 
-                            if (matchesEvidence || matchesName)
+                            if (!matchesEvidence && !matchesName) continue;
+
+                            var confidence = matchesEvidence ? OwnershipConfidence.Certain : OwnershipConfidence.Medium;
+                            var risk = matchesEvidence ? RiskLevel.Low : RiskLevel.Medium;
+                            var autoSelect = matchesEvidence;
+
+                            var target = $@"{hiveText}\{subKeyPath}\{hostName}";
+                            var reason = matchesEvidence
+                                ? $"Browser native messaging host points to application manifest or executable '{manifestExePath}'"
+                                : $"Browser native messaging host name '{hostName}' matches application name; review before removal";
+
+                            var evidence = new List<string> { $"Host name: {hostName}", $"Manifest: {manifestPath}" };
+                            if (!string.IsNullOrEmpty(manifestExePath)) evidence.Add($"Host binary: {manifestExePath}");
+
+                            var candidate = new CleanupCandidate
                             {
-                                var target = $@"{hiveText}\{subKeyPath}\{hostName}";
-                                candidates.Add(new CleanupCandidate
-                                {
-                                    Target = target,
-                                    Kind = CleanupKind.RegistryKey,
-                                    RegistryViewName = viewName,
-                                    Risk = RiskLevel.Low,
-                                    Confidence = matchesEvidence ? OwnershipConfidence.Certain : OwnershipConfidence.High,
-                                    Scope = scope,
-                                    Reason = $"Browser native messaging host registration ({viewName}-bit view)",
-                                    SourceProvider = Name,
-                                    EvidenceList = [$"Host name: {hostName}", $"Manifest: {manifestPath}"],
-                                    IsSelected = true
-                                });
-                            }
+                                Target = target,
+                                Kind = CleanupKind.RegistryKey,
+                                RegistryViewName = viewName,
+                                Risk = risk,
+                                Confidence = confidence,
+                                Scope = scope,
+                                Reason = reason,
+                                SourceProvider = Name,
+                                EvidenceList = evidence,
+                                AutoSelectable = autoSelect
+                            };
+                            candidate.IsSelected = CleanupSelectionPolicy.ShouldAutoSelect(candidate);
+                            candidates.Add(candidate);
                         }
                     }
-                    catch { }
+                    catch (UnauthorizedAccessException ex)
+                    {
+                        diagnostics.Add(new ScanDiagnostic(Name, $"Access denied reading native messaging hosts in {hiveText}\\{subKeyPath}", IsWarning: true, ExceptionDetail: ex.Message));
+                        statusAcc.MarkAccessDenied();
+                    }
+                    catch (Exception ex)
+                    {
+                        diagnostics.Add(new ScanDiagnostic(Name, $"Error reading native messaging hosts in {hiveText}\\{subKeyPath}: {ex.Message}", IsWarning: true, ExceptionDetail: ex.Message));
+                        statusAcc.MarkWarning();
+                    }
                 }
             }
         }
+    }
+
+    private static string TryExtractHostExecutable(string manifestPath)
+    {
+        if (string.IsNullOrWhiteSpace(manifestPath) || !File.Exists(manifestPath)) return "";
+        try
+        {
+            var json = File.ReadAllText(manifestPath);
+            using var doc = JsonDocument.Parse(json);
+            if (doc.RootElement.TryGetProperty("path", out var pathProp))
+            {
+                var pathVal = pathProp.GetString();
+                if (!string.IsNullOrEmpty(pathVal))
+                {
+                    if (Path.IsPathRooted(pathVal)) return pathVal;
+                    var dir = Path.GetDirectoryName(manifestPath);
+                    return string.IsNullOrEmpty(dir) ? pathVal : Path.Combine(dir, pathVal);
+                }
+            }
+        }
+        catch { }
+        return "";
     }
 }

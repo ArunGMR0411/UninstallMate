@@ -95,6 +95,8 @@ public sealed class PathSegmentBackupData
     public required string ValueName { get; init; }
     public required string RemovedSegment { get; init; }
     public int OriginalIndex { get; init; }
+    public string PreviousSegment { get; init; } = "";
+    public string NextSegment { get; init; } = "";
 }
 
 public sealed class FirewallRuleBackupData

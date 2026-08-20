@@ -160,6 +160,14 @@ public static class QuarantineService
         }
     }
 
+    public static void RestoreRegistryValueBundle(RegistryValueBackupBundle bundle)
+    {
+        foreach (var val in bundle.Values)
+        {
+            RestoreExactValue(val);
+        }
+    }
+
     public static void RestoreExactValue(RegistryValueBackupData data)
     {
         if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows)) return;
@@ -234,20 +242,43 @@ public static class QuarantineService
         if (key is null) return;
 
         var current = Convert.ToString(key.GetValue(data.ValueName, "", RegistryValueOptions.DoNotExpandEnvironmentNames)) ?? "";
-        var merged = MergePathSegment(current, data.RemovedSegment, data.OriginalIndex);
+        var merged = MergePathSegment(current, data.RemovedSegment, data.OriginalIndex, data.PreviousSegment, data.NextSegment);
         if (!merged.Equals(current, StringComparison.Ordinal))
         {
             key.SetValue(data.ValueName, merged, key.GetValueKind(data.ValueName));
         }
     }
 
-    public static string MergePathSegment(string currentPath, string segmentToRestore, int originalIndex = -1)
+    public static string MergePathSegment(string currentPath, string segmentToRestore, int originalIndex = -1, string previousSegment = "", string nextSegment = "")
     {
         if (string.IsNullOrWhiteSpace(segmentToRestore)) return currentPath;
         var segments = currentPath.Split(';', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries).ToList();
         if (segments.Any(s => s.Equals(segmentToRestore, StringComparison.OrdinalIgnoreCase)))
             return currentPath;
 
+        // 1. Previous anchor exists -> insert after it
+        if (!string.IsNullOrWhiteSpace(previousSegment))
+        {
+            var prevIdx = segments.FindIndex(s => s.Equals(previousSegment, StringComparison.OrdinalIgnoreCase));
+            if (prevIdx >= 0)
+            {
+                segments.Insert(prevIdx + 1, segmentToRestore);
+                return string.Join(';', segments);
+            }
+        }
+
+        // 2. Next anchor exists -> insert before it
+        if (!string.IsNullOrWhiteSpace(nextSegment))
+        {
+            var nextIdx = segments.FindIndex(s => s.Equals(nextSegment, StringComparison.OrdinalIgnoreCase));
+            if (nextIdx >= 0)
+            {
+                segments.Insert(nextIdx, segmentToRestore);
+                return string.Join(';', segments);
+            }
+        }
+
+        // 3. Bounded original index fallback
         if (originalIndex >= 0 && originalIndex <= segments.Count)
         {
             segments.Insert(originalIndex, segmentToRestore);

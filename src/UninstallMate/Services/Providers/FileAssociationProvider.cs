@@ -17,6 +17,7 @@ public sealed class FileAssociationProvider : ICleanupArtifactProvider
         var sw = Stopwatch.StartNew();
         var candidates = new List<CleanupCandidate>();
         var diagnostics = new List<ScanDiagnostic>();
+        var statusAcc = new ScanStatusAccumulator();
 
         if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
         {
@@ -27,20 +28,21 @@ public sealed class FileAssociationProvider : ICleanupArtifactProvider
         {
             try
             {
-                ScanRegisteredApplications(identity, context, candidates, diagnostics, token);
-                ScanClassesApplications(identity, context, candidates, diagnostics, token);
-                ScanProgIdsAndProtocols(identity, context, candidates, diagnostics, token);
+                ScanRegisteredApplications(identity, context, candidates, diagnostics, statusAcc, token);
+                ScanClassesApplications(identity, context, candidates, diagnostics, statusAcc, token);
+                ScanProgIdsAndProtocols(identity, context, candidates, diagnostics, statusAcc, token);
             }
             catch (Exception ex)
             {
                 diagnostics.Add(new ScanDiagnostic(Name, $"Error during file association scan: {ex.Message}", IsError: true, ExceptionDetail: ex.ToString()));
+                statusAcc.MarkFailed();
             }
         }, token);
 
         return new ProviderScanResult
         {
             ProviderName = Name,
-            Status = diagnostics.Any(d => d.IsError) ? ScanStatus.CompleteWithWarnings : ScanStatus.Complete,
+            Status = statusAcc.Status,
             Candidates = candidates,
             Diagnostics = diagnostics,
             Elapsed = sw.Elapsed
@@ -52,6 +54,7 @@ public sealed class FileAssociationProvider : ICleanupArtifactProvider
         CleanupScanContext context,
         List<CleanupCandidate> candidates,
         List<ScanDiagnostic> diagnostics,
+        ScanStatusAccumulator statusAcc,
         CancellationToken token)
     {
         const string registeredAppsPath = @"SOFTWARE\RegisteredApplications";
@@ -80,26 +83,37 @@ public sealed class FileAssociationProvider : ICleanupArtifactProvider
                         if (matchesName || matchesCap)
                         {
                             var target = $@"{hiveText}\{registeredAppsPath}";
-                            candidates.Add(new CleanupCandidate
+                            var candidate = new CleanupCandidate
                             {
                                 Target = target,
                                 Auxiliary = appName,
                                 Kind = CleanupKind.RegistryValue,
                                 RegistryViewName = viewName,
                                 Risk = RiskLevel.Medium,
-                                Confidence = OwnershipConfidence.High,
+                                Confidence = matchesCap ? OwnershipConfidence.High : OwnershipConfidence.Medium,
                                 Scope = scope,
                                 Reason = $"RegisteredApplications registration references app capabilities '{capabilitiesPath}'",
                                 SourceProvider = Name,
                                 RegistryValueKindName = "String",
                                 RegistryRawValueBase64 = capabilitiesPath,
                                 EvidenceList = [$"RegisteredApplication: {appName}", $"Capabilities path: {capabilitiesPath}"],
-                                IsSelected = false
-                            });
+                                AutoSelectable = false // File associations require review
+                            };
+                            candidate.IsSelected = CleanupSelectionPolicy.ShouldAutoSelect(candidate);
+                            candidates.Add(candidate);
                         }
                     }
                 }
-                catch { }
+                catch (UnauthorizedAccessException ex)
+                {
+                    diagnostics.Add(new ScanDiagnostic(Name, $"Access denied scanning RegisteredApplications in {hiveText}", IsWarning: true, TargetPath: $@"{hiveText}\{registeredAppsPath}", ExceptionDetail: ex.Message));
+                    statusAcc.MarkAccessDenied();
+                }
+                catch (Exception ex)
+                {
+                    diagnostics.Add(new ScanDiagnostic(Name, $"Failed scanning RegisteredApplications in {hiveText}: {ex.Message}", IsWarning: true, TargetPath: $@"{hiveText}\{registeredAppsPath}", ExceptionDetail: ex.Message));
+                    statusAcc.MarkWarning();
+                }
             }
         }
     }
@@ -109,6 +123,7 @@ public sealed class FileAssociationProvider : ICleanupArtifactProvider
         CleanupScanContext context,
         List<CleanupCandidate> candidates,
         List<ScanDiagnostic> diagnostics,
+        ScanStatusAccumulator statusAcc,
         CancellationToken token)
     {
         const string rootPath = @"SOFTWARE\Classes\Applications";
@@ -138,22 +153,33 @@ public sealed class FileAssociationProvider : ICleanupArtifactProvider
                         if (!matchesEvidence && !matchesExe) continue;
 
                         var target = $@"{hiveText}\{rootPath}\{appKey}";
-                        candidates.Add(new CleanupCandidate
+                        var candidate = new CleanupCandidate
                         {
                             Target = target,
                             Kind = CleanupKind.RegistryKey,
                             RegistryViewName = viewName,
                             Risk = RiskLevel.Medium,
-                            Confidence = matchesEvidence ? OwnershipConfidence.Certain : OwnershipConfidence.High,
+                            Confidence = matchesEvidence ? OwnershipConfidence.Certain : OwnershipConfidence.Medium,
                             Scope = scope,
                             Reason = "File-association application registration points into the app's installation",
                             SourceProvider = Name,
                             EvidenceList = [$"Classes\\Applications key: {appKey}", $"Command: {value}"],
-                            IsSelected = false
-                        });
+                            AutoSelectable = false
+                        };
+                        candidate.IsSelected = CleanupSelectionPolicy.ShouldAutoSelect(candidate);
+                        candidates.Add(candidate);
                     }
                 }
-                catch { }
+                catch (UnauthorizedAccessException ex)
+                {
+                    diagnostics.Add(new ScanDiagnostic(Name, $"Access denied for Classes\\Applications in {hiveText}", IsWarning: true, TargetPath: $@"{hiveText}\{rootPath}", ExceptionDetail: ex.Message));
+                    statusAcc.MarkAccessDenied();
+                }
+                catch (Exception ex)
+                {
+                    diagnostics.Add(new ScanDiagnostic(Name, $"Failed scanning Classes\\Applications in {hiveText}: {ex.Message}", IsWarning: true, TargetPath: $@"{hiveText}\{rootPath}", ExceptionDetail: ex.Message));
+                    statusAcc.MarkWarning();
+                }
             }
         }
     }
@@ -163,6 +189,7 @@ public sealed class FileAssociationProvider : ICleanupArtifactProvider
         CleanupScanContext context,
         List<CleanupCandidate> candidates,
         List<ScanDiagnostic> diagnostics,
+        ScanStatusAccumulator statusAcc,
         CancellationToken token)
     {
         const string rootPath = @"SOFTWARE\Classes";
@@ -197,7 +224,7 @@ public sealed class FileAssociationProvider : ICleanupArtifactProvider
                         if (!identity.ReferencesEvidence(combined)) continue;
 
                         var target = $@"{hiveText}\{rootPath}\{className}";
-                        candidates.Add(new CleanupCandidate
+                        var candidate = new CleanupCandidate
                         {
                             Target = target,
                             Kind = CleanupKind.RegistryKey,
@@ -208,11 +235,22 @@ public sealed class FileAssociationProvider : ICleanupArtifactProvider
                             Reason = "Protocol or file-type class registration points into the app's installation",
                             SourceProvider = Name,
                             EvidenceList = [$"Class: {className}", $"Command/Icon: {combined}"],
-                            IsSelected = false
-                        });
+                            AutoSelectable = false
+                        };
+                        candidate.IsSelected = CleanupSelectionPolicy.ShouldAutoSelect(candidate);
+                        candidates.Add(candidate);
                     }
                 }
-                catch { }
+                catch (UnauthorizedAccessException ex)
+                {
+                    diagnostics.Add(new ScanDiagnostic(Name, $"Access denied for Classes in {hiveText}", IsWarning: true, TargetPath: $@"{hiveText}\{rootPath}", ExceptionDetail: ex.Message));
+                    statusAcc.MarkAccessDenied();
+                }
+                catch (Exception ex)
+                {
+                    diagnostics.Add(new ScanDiagnostic(Name, $"Failed scanning Classes in {hiveText}: {ex.Message}", IsWarning: true, TargetPath: $@"{hiveText}\{rootPath}", ExceptionDetail: ex.Message));
+                    statusAcc.MarkWarning();
+                }
             }
         }
     }

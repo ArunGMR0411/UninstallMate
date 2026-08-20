@@ -4,9 +4,9 @@ namespace UninstallMate.Services.Providers;
 
 public sealed class CleanupScanContext
 {
-    public bool IsDeepScan { get; init; }
     public IReadOnlyList<InstalledApplication> InstalledApplications { get; init; } = [];
     public ApplicationIdentityGraph? PreUninstallIdentity { get; init; }
+    public ApplicationIdentityCaptureResult? PreUninstallCaptureResult { get; init; }
     public Action<ScanDiagnostic>? DiagnosticSink { get; init; }
 
     public bool IsSharedWithOtherInstalledApp(string pathOrName, string currentAppId)

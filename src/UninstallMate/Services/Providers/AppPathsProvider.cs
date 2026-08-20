@@ -17,6 +17,7 @@ public sealed class AppPathsProvider : ICleanupArtifactProvider
         var sw = Stopwatch.StartNew();
         var candidates = new List<CleanupCandidate>();
         var diagnostics = new List<ScanDiagnostic>();
+        var statusAcc = new ScanStatusAccumulator();
 
         if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
         {
@@ -27,18 +28,19 @@ public sealed class AppPathsProvider : ICleanupArtifactProvider
         {
             try
             {
-                ScanAppPaths(identity, context, candidates, diagnostics, token);
+                ScanAppPaths(identity, context, candidates, diagnostics, statusAcc, token);
             }
             catch (Exception ex)
             {
                 diagnostics.Add(new ScanDiagnostic(Name, $"Error during App Paths scan: {ex.Message}", IsError: true, ExceptionDetail: ex.ToString()));
+                statusAcc.MarkFailed();
             }
         }, token);
 
         return new ProviderScanResult
         {
             ProviderName = Name,
-            Status = diagnostics.Any(d => d.IsError) ? ScanStatus.CompleteWithWarnings : ScanStatus.Complete,
+            Status = statusAcc.Status,
             Candidates = candidates,
             Diagnostics = diagnostics,
             Elapsed = sw.Elapsed
@@ -50,6 +52,7 @@ public sealed class AppPathsProvider : ICleanupArtifactProvider
         CleanupScanContext context,
         List<CleanupCandidate> candidates,
         List<ScanDiagnostic> diagnostics,
+        ScanStatusAccumulator statusAcc,
         CancellationToken token)
     {
         const string rootPath = @"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths";
@@ -80,36 +83,74 @@ public sealed class AppPathsProvider : ICleanupArtifactProvider
                         var combined = defaultVal + ";" + pathVal;
 
                         var matchesEvidence = identity.ReferencesEvidence(combined);
-                        var matchesExe = identity.ExecutableNames.Any(e => e.Equals(name, StringComparison.OrdinalIgnoreCase));
-                        var matchesPre = identity.CapturedAppPaths.Any(p => p.ExeName.Equals(name, StringComparison.OrdinalIgnoreCase));
+                        var matchesExe = identity.ExecutableNames.Any(e => e.Equals(name, StringComparison.OrdinalIgnoreCase))
+                            || identity.CandidateNames.Any(c => c.Equals(name, StringComparison.OrdinalIgnoreCase));
 
-                        if (!matchesEvidence && !matchesExe && !matchesPre) continue;
+                        var matchingPre = identity.CapturedAppPaths.FirstOrDefault(p =>
+                            p.Hive == hiveName && p.View == view && p.ExeName.Equals(name, StringComparison.OrdinalIgnoreCase));
 
-                        var confidence = (matchesPre || matchesEvidence) ? OwnershipConfidence.Certain : OwnershipConfidence.High;
+                        if (!matchesEvidence && !matchesExe && matchingPre is null) continue;
+
+                        OwnershipConfidence confidence;
+                        RiskLevel risk;
+                        bool autoSelect;
+
+                        if (matchesEvidence)
+                        {
+                            confidence = OwnershipConfidence.Certain;
+                            risk = RiskLevel.Low;
+                            autoSelect = true;
+                        }
+                        else if (matchingPre is not null && matchingPre.Confidence.IsAtLeast(OwnershipConfidence.High))
+                        {
+                            confidence = matchingPre.Confidence;
+                            risk = RiskLevel.Low;
+                            autoSelect = true;
+                        }
+                        else
+                        {
+                            // Name-only match without path evidence remains Medium confidence, Medium risk, not auto-selectable
+                            confidence = OwnershipConfidence.Medium;
+                            risk = RiskLevel.Medium;
+                            autoSelect = false;
+                        }
+
                         var target = $@"{hiveText}\{rootPath}\{name}";
+                        var reason = matchesEvidence
+                            ? $"Windows App Paths registration points into the app's installation: {defaultVal} ({viewName}-bit view)"
+                            : (matchingPre is not null && matchingPre.Confidence == OwnershipConfidence.Certain
+                                ? $"Pre-uninstall verified App Paths registration for '{name}'"
+                                : $"App Paths registration '{name}' matches application executable name; review before removal");
 
-                        candidates.Add(new CleanupCandidate
+                        var evidence = new List<string> { $"App Paths key '{name}' -> {defaultVal}" };
+                        if (matchingPre is not null) evidence.AddRange(matchingPre.Evidence);
+
+                        var candidate = new CleanupCandidate
                         {
                             Target = target,
                             Kind = CleanupKind.RegistryKey,
                             RegistryViewName = viewName,
-                            Risk = RiskLevel.Low,
+                            Risk = risk,
                             Confidence = confidence,
                             Scope = scope,
-                            Reason = $"Windows App Paths registration points into the app's installation ({viewName}-bit view)",
+                            Reason = reason,
                             SourceProvider = Name,
-                            EvidenceList = [$"App Paths key '{name}' -> {defaultVal}"],
-                            IsSelected = true
-                        });
+                            EvidenceList = evidence,
+                            AutoSelectable = autoSelect
+                        };
+                        candidate.IsSelected = CleanupSelectionPolicy.ShouldAutoSelect(candidate);
+                        candidates.Add(candidate);
                     }
                 }
                 catch (UnauthorizedAccessException ex)
                 {
                     diagnostics.Add(new ScanDiagnostic(Name, $"Access denied for App Paths in {hiveText}", IsWarning: true, TargetPath: $@"{hiveText}\{rootPath}", ExceptionDetail: ex.Message));
+                    statusAcc.MarkAccessDenied();
                 }
                 catch (Exception ex)
                 {
                     diagnostics.Add(new ScanDiagnostic(Name, $"Failed scanning App Paths in {hiveText} ({viewName}-bit): {ex.Message}", IsWarning: true, TargetPath: $@"{hiveText}\{rootPath}", ExceptionDetail: ex.Message));
+                    statusAcc.MarkWarning();
                 }
             }
         }

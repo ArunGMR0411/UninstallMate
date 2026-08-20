@@ -17,23 +17,25 @@ public sealed class ShortcutProvider : ICleanupArtifactProvider
         var sw = Stopwatch.StartNew();
         var candidates = new List<CleanupCandidate>();
         var diagnostics = new List<ScanDiagnostic>();
+        var statusAcc = new ScanStatusAccumulator();
 
         await Task.Run(() =>
         {
             try
             {
-                ScanShortcuts(identity, context, candidates, diagnostics, token);
+                ScanShortcuts(identity, context, candidates, diagnostics, statusAcc, token);
             }
             catch (Exception ex)
             {
                 diagnostics.Add(new ScanDiagnostic(Name, $"Error during shortcut scan: {ex.Message}", IsError: true, ExceptionDetail: ex.ToString()));
+                statusAcc.MarkFailed();
             }
         }, token);
 
         return new ProviderScanResult
         {
             ProviderName = Name,
-            Status = diagnostics.Any(d => d.IsError) ? ScanStatus.CompleteWithWarnings : ScanStatus.Complete,
+            Status = statusAcc.Status,
             Candidates = candidates,
             Diagnostics = diagnostics,
             Elapsed = sw.Elapsed
@@ -45,6 +47,7 @@ public sealed class ShortcutProvider : ICleanupArtifactProvider
         CleanupScanContext context,
         List<CleanupCandidate> candidates,
         List<ScanDiagnostic> diagnostics,
+        ScanStatusAccumulator statusAcc,
         CancellationToken token)
     {
         var names = identity.CandidateNames.ToArray();
@@ -54,10 +57,12 @@ public sealed class ShortcutProvider : ICleanupArtifactProvider
             (Environment.GetFolderPath(Environment.SpecialFolder.CommonDesktopDirectory), CleanupScope.System),
             (Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.StartMenu), "Programs"), CleanupScope.User),
             (Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonStartMenu), "Programs"), CleanupScope.System)
-        }.Where(r => Directory.Exists(r.Item1)).DistinctBy(r => r.Item1, StringComparer.OrdinalIgnoreCase);
+        }.Where(r => !string.IsNullOrWhiteSpace(r.Item1) && Directory.Exists(r.Item1)).DistinctBy(r => r.Item1, StringComparer.OrdinalIgnoreCase);
 
         foreach (var (root, scope) in roots)
         {
+            token.ThrowIfCancellationRequested();
+
             // 1. Check for app-specific shortcut folder (e.g. Start Menu\Programs\Acme\)
             foreach (var name in names)
             {
@@ -66,7 +71,7 @@ public sealed class ShortcutProvider : ICleanupArtifactProvider
                 {
                     var fullFolder = Path.GetFullPath(folderPath).TrimEnd(Path.DirectorySeparatorChar);
                     var size = CleanupScanner.GetDirectorySize(fullFolder);
-                    candidates.Add(new CleanupCandidate
+                    var candidate = new CleanupCandidate
                     {
                         Target = fullFolder,
                         Kind = CleanupKind.Directory,
@@ -77,9 +82,10 @@ public sealed class ShortcutProvider : ICleanupArtifactProvider
                         Scope = scope,
                         SourceProvider = Name,
                         EvidenceList = [$"Shortcut directory: {fullFolder}"],
-                        AutoSelectable = true,
-                        IsSelected = true
-                    });
+                        AutoSelectable = true
+                    };
+                    candidate.IsSelected = CleanupSelectionPolicy.ShouldAutoSelect(candidate);
+                    candidates.Add(candidate);
                 }
             }
 
@@ -95,9 +101,16 @@ public sealed class ShortcutProvider : ICleanupArtifactProvider
                 }).Where(x => Path.GetExtension(x).Equals(".lnk", StringComparison.OrdinalIgnoreCase)
                     || Path.GetExtension(x).Equals(".url", StringComparison.OrdinalIgnoreCase));
             }
+            catch (UnauthorizedAccessException ex)
+            {
+                diagnostics.Add(new ScanDiagnostic(Name, $"Access denied enumerating shortcuts in '{root}': {ex.Message}", IsWarning: true, TargetPath: root));
+                statusAcc.MarkAccessDenied();
+                continue;
+            }
             catch (Exception ex)
             {
                 diagnostics.Add(new ScanDiagnostic(Name, $"Failed enumerating shortcuts in '{root}': {ex.Message}", IsWarning: true, TargetPath: root));
+                statusAcc.MarkWarning();
                 continue;
             }
 
@@ -113,35 +126,75 @@ public sealed class ShortcutProvider : ICleanupArtifactProvider
                 var targetPath = resolution.HasTarget ? resolution.TargetPath : "";
                 var pathMatch = identity.ReferencesEvidence(targetPath);
                 var matchesName = names.Any(name => ShortcutNameMatches(shortcutName, name));
-                var matchesPreUninstall = identity.CapturedStartupSources.Any(s => s.CorrelationKey.ValueName.Equals(shortcutName, StringComparison.OrdinalIgnoreCase));
 
-                if (pathMatch || matchesName || matchesPreUninstall)
+                // Check pre-uninstall verified shortcut provenance
+                var matchingCapturedShortcut = identity.CapturedShortcuts.FirstOrDefault(s =>
+                    s.ShortcutPath.Equals(file, StringComparison.OrdinalIgnoreCase)
+                    || (s.ShortcutName.Equals(shortcutName, StringComparison.OrdinalIgnoreCase) && s.Scope == scope));
+
+                var capturedPathVerified = matchingCapturedShortcut is not null && matchingCapturedShortcut.Confidence == OwnershipConfidence.Certain;
+
+                // Ownership Rules:
+                // 1. Path Match or Pre-uninstall Path-verified -> Certain / Low Risk / AutoSelectable
+                // 2. Name match with unrelated target binary -> Ignored / High Risk / NOT AutoSelectable
+                // 3. Name match without target binary -> Medium / Medium Risk / NOT AutoSelectable
+
+                if (pathMatch || capturedPathVerified)
                 {
                     var size = 0L;
                     try { size = new FileInfo(file).Length; } catch { }
 
-                    var confidence = pathMatch ? OwnershipConfidence.Certain
-                        : (matchesPreUninstall ? OwnershipConfidence.Certain : OwnershipConfidence.High);
-
                     var evidence = new List<string> { $"Shortcut file: {file}" };
                     if (pathMatch) evidence.Add($"Resolved target points to app binary: {targetPath}");
+                    if (capturedPathVerified && matchingCapturedShortcut is not null)
+                        evidence.Add($"Pre-uninstall verified target: {matchingCapturedShortcut.ResolvedTarget}");
 
-                    candidates.Add(new CleanupCandidate
+                    var candidate = new CleanupCandidate
                     {
                         Target = file,
                         Kind = CleanupKind.File,
                         Risk = RiskLevel.Low,
-                        Confidence = confidence,
+                        Confidence = OwnershipConfidence.Certain,
                         Reason = pathMatch
                             ? $"Shortcut targets application executable '{targetPath}'"
-                            : "App-named desktop or Start menu shortcut",
+                            : "Pre-uninstall verified application shortcut",
                         SizeBytes = size,
                         Scope = scope,
                         SourceProvider = Name,
                         EvidenceList = evidence,
-                        AutoSelectable = true,
-                        IsSelected = true
-                    });
+                        AutoSelectable = true
+                    };
+                    candidate.IsSelected = CleanupSelectionPolicy.ShouldAutoSelect(candidate);
+                    candidates.Add(candidate);
+                }
+                else if (matchesName)
+                {
+                    // Unrelated target check
+                    if (resolution.HasTarget && !string.IsNullOrWhiteSpace(targetPath) && File.Exists(targetPath))
+                    {
+                        // Target exists and belongs to another application -> do NOT claim ownership
+                        continue;
+                    }
+
+                    // Broken or unresolved name match -> Medium Confidence / Medium Risk / Unselected
+                    var size = 0L;
+                    try { size = new FileInfo(file).Length; } catch { }
+
+                    var candidate = new CleanupCandidate
+                    {
+                        Target = file,
+                        Kind = CleanupKind.File,
+                        Risk = RiskLevel.Medium,
+                        Confidence = OwnershipConfidence.Medium,
+                        Reason = $"Shortcut name '{shortcutName}' matches application name; verify target before removal",
+                        SizeBytes = size,
+                        Scope = scope,
+                        SourceProvider = Name,
+                        EvidenceList = [$"Shortcut file: {file}", "Name match only without verified target path"],
+                        AutoSelectable = false
+                    };
+                    candidate.IsSelected = CleanupSelectionPolicy.ShouldAutoSelect(candidate);
+                    candidates.Add(candidate);
                 }
             }
         }

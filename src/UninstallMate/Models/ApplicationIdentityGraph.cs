@@ -16,9 +16,9 @@ public enum StartupSourceKind
 
 public sealed record StartupCorrelationKey(
     RegistryHive Hive,
-    RegistryView View,
     StartupSourceKind Kind,
-    string ValueName);
+    string ValueName,
+    RegistryView? View = null);
 
 public sealed record CapturedStartupSource(
     StartupCorrelationKey CorrelationKey,
@@ -33,12 +33,23 @@ public sealed record CapturedStartupApproval(
     string RegistryPath,
     byte[] RawData);
 
+public sealed record CapturedShortcutEntry(
+    string ShortcutPath,
+    string ShortcutName,
+    string ResolvedTarget,
+    string Arguments,
+    CleanupScope Scope,
+    OwnershipConfidence Confidence,
+    IReadOnlyList<string> Evidence);
+
 public sealed record CapturedServiceEntry(
     string ServiceName,
     string DisplayName,
     string ImagePath,
     string ServiceDll,
-    bool IsDriver);
+    bool IsDriver,
+    OwnershipConfidence Confidence,
+    IReadOnlyList<string> Evidence);
 
 public sealed record CapturedTaskEntry(
     string TaskName,
@@ -46,14 +57,18 @@ public sealed record CapturedTaskEntry(
     string Execute,
     string Arguments,
     string WorkingDirectory,
+    string? Xml,
     OwnershipConfidence Confidence,
     IReadOnlyList<string> Evidence);
 
 public sealed record CapturedAppPathEntry(
-    string Hive,
-    string View,
+    RegistryHive Hive,
+    RegistryView View,
     string ExeName,
-    string TargetPath);
+    string DefaultTarget,
+    string PathValue,
+    OwnershipConfidence Confidence,
+    IReadOnlyList<string> Evidence);
 
 public sealed class ApplicationIdentityCaptureResult
 {
@@ -83,6 +98,7 @@ public sealed partial class ApplicationIdentityGraph
     public List<string> CandidateNames { get; init; } = [];
     public List<CapturedStartupSource> CapturedStartupSources { get; init; } = [];
     public List<CapturedStartupApproval> CapturedStartupApprovedEntries { get; init; } = [];
+    public List<CapturedShortcutEntry> CapturedShortcuts { get; init; } = [];
     public List<CapturedServiceEntry> CapturedServices { get; init; } = [];
     public List<CapturedTaskEntry> CapturedTasks { get; init; } = [];
     public List<CapturedAppPathEntry> CapturedAppPaths { get; init; } = [];
@@ -92,20 +108,20 @@ public sealed partial class ApplicationIdentityGraph
     {
         var graph = Create(app);
         var diagnostics = new List<ScanDiagnostic>();
-        var status = ScanStatus.Complete;
+        var statusAcc = new ScanStatusAccumulator();
 
         if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
         {
             await Task.Run(() =>
             {
-                CaptureWindowsPreUninstallState(graph, diagnostics, ref status, token);
+                CaptureWindowsPreUninstallState(graph, diagnostics, statusAcc, token);
             }, token);
         }
 
         return new ApplicationIdentityCaptureResult
         {
             Identity = graph,
-            Status = status,
+            Status = statusAcc.Status,
             Diagnostics = diagnostics
         };
     }
@@ -136,42 +152,49 @@ public sealed partial class ApplicationIdentityGraph
     private static void CaptureWindowsPreUninstallState(
         ApplicationIdentityGraph graph,
         List<ScanDiagnostic> diagnostics,
-        ref ScanStatus status,
+        ScanStatusAccumulator statusAcc,
         CancellationToken token)
     {
-        try { CaptureStartupState(graph, diagnostics, ref status, token); }
+        try { CaptureStartupState(graph, diagnostics, statusAcc, token); }
         catch (Exception ex)
         {
-            diagnostics.Add(new ScanDiagnostic("PreUninstallIdentity", $"Startup capture error: {ex.Message}", IsWarning: true));
-            if (status == ScanStatus.Complete) status = ScanStatus.CompleteWithWarnings;
+            diagnostics.Add(new ScanDiagnostic("PreUninstallIdentity", $"Startup capture error: {ex.Message}", IsError: true, ExceptionDetail: ex.ToString()));
+            statusAcc.MarkPartial();
         }
 
-        try { CaptureServices(graph, diagnostics, ref status, token); }
+        try { CaptureShortcuts(graph, diagnostics, statusAcc, token); }
         catch (Exception ex)
         {
-            diagnostics.Add(new ScanDiagnostic("PreUninstallIdentity", $"Services capture error: {ex.Message}", IsWarning: true));
-            if (status == ScanStatus.Complete) status = ScanStatus.CompleteWithWarnings;
+            diagnostics.Add(new ScanDiagnostic("PreUninstallIdentity", $"Shortcuts capture error: {ex.Message}", IsError: true, ExceptionDetail: ex.ToString()));
+            statusAcc.MarkPartial();
         }
 
-        try { CaptureTasks(graph, diagnostics, ref status, token); }
+        try { CaptureServices(graph, diagnostics, statusAcc, token); }
         catch (Exception ex)
         {
-            diagnostics.Add(new ScanDiagnostic("PreUninstallIdentity", $"Task capture error: {ex.Message}", IsWarning: true));
-            if (status == ScanStatus.Complete) status = ScanStatus.CompleteWithWarnings;
+            diagnostics.Add(new ScanDiagnostic("PreUninstallIdentity", $"Services capture error: {ex.Message}", IsError: true, ExceptionDetail: ex.ToString()));
+            statusAcc.MarkPartial();
         }
 
-        try { CaptureAppPaths(graph, diagnostics, ref status, token); }
+        try { CaptureTasks(graph, diagnostics, statusAcc, token); }
         catch (Exception ex)
         {
-            diagnostics.Add(new ScanDiagnostic("PreUninstallIdentity", $"AppPaths capture error: {ex.Message}", IsWarning: true));
-            if (status == ScanStatus.Complete) status = ScanStatus.CompleteWithWarnings;
+            diagnostics.Add(new ScanDiagnostic("PreUninstallIdentity", $"Task capture error: {ex.Message}", IsError: true, ExceptionDetail: ex.ToString()));
+            statusAcc.MarkPartial();
+        }
+
+        try { CaptureAppPaths(graph, diagnostics, statusAcc, token); }
+        catch (Exception ex)
+        {
+            diagnostics.Add(new ScanDiagnostic("PreUninstallIdentity", $"AppPaths capture error: {ex.Message}", IsError: true, ExceptionDetail: ex.ToString()));
+            statusAcc.MarkPartial();
         }
     }
 
     private static void CaptureStartupState(
         ApplicationIdentityGraph graph,
         List<ScanDiagnostic> diagnostics,
-        ref ScanStatus status,
+        ScanStatusAccumulator statusAcc,
         CancellationToken token)
     {
         var runLocations = new[]
@@ -182,7 +205,6 @@ public sealed partial class ApplicationIdentityGraph
             (RegistryHive.LocalMachine, @"SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce", StartupSourceKind.RunOnce)
         };
 
-        // 1. Capture Run and RunOnce values
         foreach (var (hiveName, subKey, kind) in runLocations)
         {
             foreach (var view in new[] { RegistryView.Registry64, RegistryView.Registry32 })
@@ -202,13 +224,12 @@ public sealed partial class ApplicationIdentityGraph
 
                         if (pathMatch || nameMatch)
                         {
-                            // Path evidence produces Certain/High confidence; Name-only match is strictly Medium confidence
                             var confidence = pathMatch ? OwnershipConfidence.Certain : OwnershipConfidence.Medium;
                             var evidence = new List<string>();
                             if (pathMatch) evidence.Add($"Command points into app installation: {value}");
                             if (nameMatch) evidence.Add($"Value name matches candidate name '{valueName}'");
 
-                            var correlationKey = new StartupCorrelationKey(hiveName, view, kind, valueName);
+                            var correlationKey = new StartupCorrelationKey(hiveName, kind, valueName, view);
                             var hiveText = hiveName == RegistryHive.CurrentUser ? "HKEY_CURRENT_USER" : "HKEY_LOCAL_MACHINE";
                             var regPath = $@"{hiveText}\{subKey}";
 
@@ -220,56 +241,17 @@ public sealed partial class ApplicationIdentityGraph
                 catch (UnauthorizedAccessException ex)
                 {
                     diagnostics.Add(new ScanDiagnostic("PreUninstallIdentity", $"Access denied reading startup key {hiveName}\\{subKey}: {ex.Message}", IsWarning: true));
-                    if (status == ScanStatus.Complete) status = ScanStatus.CompleteWithWarnings;
+                    statusAcc.MarkAccessDenied();
                 }
                 catch (Exception ex)
                 {
                     diagnostics.Add(new ScanDiagnostic("PreUninstallIdentity", $"Error reading startup key {hiveName}\\{subKey}: {ex.Message}", IsWarning: true));
-                    if (status == ScanStatus.Complete) status = ScanStatus.CompleteWithWarnings;
+                    statusAcc.MarkWarning();
                 }
             }
         }
 
-        // 2. Capture Startup folder shortcuts with resolved targets
-        var startupFolders = new[]
-        {
-            (Environment.GetFolderPath(Environment.SpecialFolder.Startup), RegistryHive.CurrentUser, "UserStartupFolder"),
-            (Environment.GetFolderPath(Environment.SpecialFolder.CommonStartup), RegistryHive.LocalMachine, "CommonStartupFolder")
-        };
-
-        foreach (var (folder, hiveName, kindLabel) in startupFolders)
-        {
-            if (string.IsNullOrWhiteSpace(folder) || !Directory.Exists(folder)) continue;
-            try
-            {
-                foreach (var file in Directory.EnumerateFiles(folder, "*.*", SearchOption.TopDirectoryOnly))
-                {
-                    var name = Path.GetFileNameWithoutExtension(file);
-                    var resolution = file.EndsWith(".lnk", StringComparison.OrdinalIgnoreCase)
-                        ? ShortcutResolver.Resolve(file)
-                        : ShortcutResolution.Empty;
-
-                    var targetPath = resolution.HasTarget ? resolution.TargetPath : file;
-                    var pathMatch = graph.ReferencesEvidence(targetPath);
-                    var nameMatch = graph.CandidateNames.Any(c => c.Equals(name, StringComparison.OrdinalIgnoreCase));
-
-                    if (pathMatch || nameMatch)
-                    {
-                        var confidence = pathMatch ? OwnershipConfidence.Certain : OwnershipConfidence.Medium;
-                        var evidence = new List<string>();
-                        if (pathMatch) evidence.Add($"Shortcut target resolves to app installation: {targetPath}");
-                        if (nameMatch) evidence.Add($"Shortcut name matches candidate name '{name}'");
-
-                        var correlationKey = new StartupCorrelationKey(hiveName, RegistryView.Default, StartupSourceKind.StartupFolder, name);
-                        graph.CapturedStartupSources.Add(new CapturedStartupSource(
-                            correlationKey, folder, file, targetPath, confidence, evidence));
-                    }
-                }
-            }
-            catch { }
-        }
-
-        // 3. Capture StartupApproved entries in HKCU and HKLM
+        // Capture StartupApproved entries in HKCU and HKLM
         var approvedLocations = new[]
         {
             (RegistryHive.CurrentUser, @"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run", StartupSourceKind.Run),
@@ -294,7 +276,7 @@ public sealed partial class ApplicationIdentityGraph
                     foreach (var valueName in key.GetValueNames())
                     {
                         var rawBytes = key.GetValue(valueName) as byte[] ?? [];
-                        var correlationKey = new StartupCorrelationKey(hiveName, view, kind, valueName);
+                        var correlationKey = new StartupCorrelationKey(hiveName, kind, valueName, kind == StartupSourceKind.StartupFolder ? null : view);
                         var hiveText = hiveName == RegistryHive.CurrentUser ? "HKEY_CURRENT_USER" : "HKEY_LOCAL_MACHINE";
                         var regPath = $@"{hiveText}\{subKey}";
 
@@ -307,10 +289,79 @@ public sealed partial class ApplicationIdentityGraph
         }
     }
 
+    private static void CaptureShortcuts(
+        ApplicationIdentityGraph graph,
+        List<ScanDiagnostic> diagnostics,
+        ScanStatusAccumulator statusAcc,
+        CancellationToken token)
+    {
+        var shortcutFolders = new[]
+        {
+            (Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory), CleanupScope.User),
+            (Environment.GetFolderPath(Environment.SpecialFolder.CommonDesktopDirectory), CleanupScope.System),
+            (Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.StartMenu), "Programs"), CleanupScope.User),
+            (Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonStartMenu), "Programs"), CleanupScope.System),
+            (Environment.GetFolderPath(Environment.SpecialFolder.Startup), CleanupScope.User),
+            (Environment.GetFolderPath(Environment.SpecialFolder.CommonStartup), CleanupScope.System)
+        }.Where(f => !string.IsNullOrWhiteSpace(f.Item1) && Directory.Exists(f.Item1)).DistinctBy(f => f.Item1, StringComparer.OrdinalIgnoreCase);
+
+        foreach (var (folder, scope) in shortcutFolders)
+        {
+            token.ThrowIfCancellationRequested();
+            try
+            {
+                foreach (var file in Directory.EnumerateFiles(folder, "*.*", SearchOption.AllDirectories))
+                {
+                    if (!file.EndsWith(".lnk", StringComparison.OrdinalIgnoreCase) && !file.EndsWith(".url", StringComparison.OrdinalIgnoreCase))
+                        continue;
+
+                    var name = Path.GetFileNameWithoutExtension(file);
+                    var resolution = file.EndsWith(".lnk", StringComparison.OrdinalIgnoreCase)
+                        ? ShortcutResolver.Resolve(file)
+                        : ShortcutResolution.Empty;
+
+                    var targetPath = resolution.HasTarget ? resolution.TargetPath : "";
+                    var pathMatch = graph.ReferencesEvidence(targetPath);
+                    var nameMatch = graph.CandidateNames.Any(c => c.Equals(name, StringComparison.OrdinalIgnoreCase));
+
+                    if (pathMatch || nameMatch)
+                    {
+                        var confidence = pathMatch ? OwnershipConfidence.Certain : OwnershipConfidence.Medium;
+                        var evidence = new List<string> { $"Shortcut file: {file}" };
+                        if (pathMatch) evidence.Add($"Target points into app installation: {targetPath}");
+                        if (nameMatch) evidence.Add($"Shortcut name matches candidate name '{name}'");
+
+                        graph.CapturedShortcuts.Add(new CapturedShortcutEntry(
+                            file, name, targetPath, resolution.Arguments, scope, confidence, evidence));
+
+                        // Also record into CapturedStartupSources if in Startup folder
+                        if (folder.Contains("Startup", StringComparison.OrdinalIgnoreCase))
+                        {
+                            var hive = scope == CleanupScope.User ? RegistryHive.CurrentUser : RegistryHive.LocalMachine;
+                            var key = new StartupCorrelationKey(hive, StartupSourceKind.StartupFolder, name, null);
+                            graph.CapturedStartupSources.Add(new CapturedStartupSource(
+                                key, folder, file, targetPath, confidence, evidence));
+                        }
+                    }
+                }
+            }
+            catch (UnauthorizedAccessException ex)
+            {
+                diagnostics.Add(new ScanDiagnostic("PreUninstallIdentity", $"Access denied enumerating shortcuts in '{folder}': {ex.Message}", IsWarning: true));
+                statusAcc.MarkAccessDenied();
+            }
+            catch (Exception ex)
+            {
+                diagnostics.Add(new ScanDiagnostic("PreUninstallIdentity", $"Error enumerating shortcuts in '{folder}': {ex.Message}", IsWarning: true));
+                statusAcc.MarkWarning();
+            }
+        }
+    }
+
     private static void CaptureServices(
         ApplicationIdentityGraph graph,
         List<ScanDiagnostic> diagnostics,
-        ref ScanStatus status,
+        ScanStatusAccumulator statusAcc,
         CancellationToken token)
     {
         const string servicesSubKey = @"SYSTEM\CurrentControlSet\Services";
@@ -334,25 +385,34 @@ public sealed partial class ApplicationIdentityGraph
                         serviceDll = Convert.ToString(paramsKey.GetValue("ServiceDll", "", RegistryValueOptions.DoNotExpandEnvironmentNames)) ?? "";
                 }
 
-                if (graph.ReferencesEvidence(imagePath) || graph.ReferencesEvidence(serviceDll) || graph.CandidateNames.Any(c => c.Equals(serviceName, StringComparison.OrdinalIgnoreCase)))
+                var pathMatch = graph.ReferencesEvidence(imagePath) || graph.ReferencesEvidence(serviceDll);
+                var nameMatch = graph.CandidateNames.Any(c => c.Equals(serviceName, StringComparison.OrdinalIgnoreCase));
+
+                if (pathMatch || nameMatch)
                 {
                     var type = Convert.ToInt32(service.GetValue("Type") ?? 0);
                     var displayName = Convert.ToString(service.GetValue("DisplayName")) ?? serviceName;
+                    var confidence = pathMatch ? OwnershipConfidence.Certain : OwnershipConfidence.Medium;
+                    var evidence = new List<string>();
+                    if (pathMatch) evidence.Add($"Service binary matches evidence: {imagePath}");
+                    if (nameMatch) evidence.Add($"Service name matches '{serviceName}'");
+
                     graph.CapturedServices.Add(new CapturedServiceEntry(
-                        serviceName, displayName, imagePath, serviceDll, (type & 0x3) != 0));
+                        serviceName, displayName, imagePath, serviceDll, (type & 0x3) != 0, confidence, evidence));
                 }
             }
         }
         catch (Exception ex)
         {
             diagnostics.Add(new ScanDiagnostic("PreUninstallIdentity", $"Error capturing services: {ex.Message}", IsWarning: true));
+            statusAcc.MarkWarning();
         }
     }
 
     private static void CaptureTasks(
         ApplicationIdentityGraph graph,
         List<ScanDiagnostic> diagnostics,
-        ref ScanStatus status,
+        ScanStatusAccumulator statusAcc,
         CancellationToken token)
     {
         try
@@ -375,7 +435,7 @@ public sealed partial class ApplicationIdentityGraph
             if (process is not null)
             {
                 var output = process.StandardOutput.ReadToEnd();
-                process.WaitForExit(4000);
+                process.WaitForExit(5000);
                 if (!string.IsNullOrWhiteSpace(output))
                 {
                     using var document = JsonDocument.Parse(output);
@@ -403,31 +463,33 @@ public sealed partial class ApplicationIdentityGraph
                             if (nameMatch) evidence.Add($"Task name matches candidate name '{taskName}'");
 
                             graph.CapturedTasks.Add(new CapturedTaskEntry(
-                                taskName, taskPath, execute, args, workDir, confidence, evidence));
+                                taskName, taskPath, execute, args, workDir, null, confidence, evidence));
                         }
                     }
                 }
             }
         }
-        catch { }
+        catch (Exception ex)
+        {
+            diagnostics.Add(new ScanDiagnostic("PreUninstallIdentity", $"Error capturing scheduled tasks: {ex.Message}", IsWarning: true));
+            statusAcc.MarkWarning();
+        }
     }
 
     private static void CaptureAppPaths(
         ApplicationIdentityGraph graph,
         List<ScanDiagnostic> diagnostics,
-        ref ScanStatus status,
+        ScanStatusAccumulator statusAcc,
         CancellationToken token)
     {
         const string appPathsSubKey = @"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths";
         foreach (var hiveName in new[] { RegistryHive.CurrentUser, RegistryHive.LocalMachine })
         {
-            var hiveText = hiveName == RegistryHive.CurrentUser ? "HKEY_CURRENT_USER" : "HKEY_LOCAL_MACHINE";
-            foreach (var viewName in new[] { "64", "32" })
+            foreach (var view in new[] { RegistryView.Registry64, RegistryView.Registry32 })
             {
                 token.ThrowIfCancellationRequested();
                 try
                 {
-                    var view = viewName == "32" ? RegistryView.Registry32 : RegistryView.Registry64;
                     using var baseKey = RegistryKey.OpenBaseKey(hiveName, view);
                     using var appPaths = baseKey.OpenSubKey(appPathsSubKey);
                     if (appPaths is null) continue;
@@ -437,12 +499,26 @@ public sealed partial class ApplicationIdentityGraph
                         if (key is null) continue;
                         var defaultVal = Convert.ToString(key.GetValue(null)) ?? "";
                         var pathVal = Convert.ToString(key.GetValue("Path")) ?? "";
-                        if (graph.ReferencesEvidence(defaultVal + ";" + pathVal) || graph.ExecutableNames.Any(e => e.Equals(exeName, StringComparison.OrdinalIgnoreCase)))
+                        var pathMatch = graph.ReferencesEvidence(defaultVal + ";" + pathVal);
+                        var nameMatch = graph.ExecutableNames.Any(e => e.Equals(exeName, StringComparison.OrdinalIgnoreCase))
+                            || graph.CandidateNames.Any(c => c.Equals(exeName, StringComparison.OrdinalIgnoreCase));
+
+                        if (pathMatch || nameMatch)
                         {
+                            var confidence = pathMatch ? OwnershipConfidence.Certain : OwnershipConfidence.Medium;
+                            var evidence = new List<string>();
+                            if (pathMatch) evidence.Add($"App Paths target points to application binary: {defaultVal}");
+                            if (nameMatch) evidence.Add($"App Paths exe key matches '{exeName}'");
+
                             graph.CapturedAppPaths.Add(new CapturedAppPathEntry(
-                                hiveText, viewName, exeName, defaultVal));
+                                hiveName, view, exeName, defaultVal, pathVal, confidence, evidence));
                         }
                     }
+                }
+                catch (UnauthorizedAccessException ex)
+                {
+                    diagnostics.Add(new ScanDiagnostic("PreUninstallIdentity", $"Access denied reading App Paths in {hiveName}: {ex.Message}", IsWarning: true));
+                    statusAcc.MarkAccessDenied();
                 }
                 catch { }
             }

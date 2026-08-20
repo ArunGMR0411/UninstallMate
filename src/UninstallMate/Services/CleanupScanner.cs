@@ -129,7 +129,10 @@ public sealed partial class CleanupScanner
                 var otherInstall = NormalizePath(other.InstallLocation);
                 if (string.IsNullOrWhiteSpace(otherInstall)) continue;
 
-                // Check if filesystem candidate is within or matches another app's install location
+                var isShared = false;
+                var sharedReason = "";
+
+                // 1. Filesystem candidates (File, Directory)
                 if (candidate.Kind is CleanupKind.File or CleanupKind.Directory)
                 {
                     var candPath = NormalizePath(candidate.Target);
@@ -137,25 +140,43 @@ public sealed partial class CleanupScanner
                         || candPath.StartsWith(otherInstall + "\\", StringComparison.OrdinalIgnoreCase)
                         || candPath.StartsWith(otherInstall + "/", StringComparison.OrdinalIgnoreCase))
                     {
-                        candidates[i] = new CleanupCandidate
-                        {
-                            Target = candidate.Target,
-                            Kind = candidate.Kind,
-                            Risk = RiskLevel.High,
-                            Confidence = candidate.Confidence,
-                            Reason = $"[Shared Component] Shared with {other.DisplayName} ({candidate.Reason})",
-                            SizeBytes = candidate.SizeBytes,
-                            RegistryViewName = candidate.RegistryViewName,
-                            Auxiliary = candidate.Auxiliary,
-                            EvidencePath = candidate.EvidencePath,
-                            EvidenceList = candidate.EvidenceList.Concat([$"Shared with installed app: {other.DisplayName}"]).ToList(),
-                            SourceProvider = candidate.SourceProvider,
-                            Scope = candidate.Scope,
-                            AutoSelectable = false,
-                            IsSelected = false
-                        };
-                        break;
+                        isShared = true;
+                        sharedReason = $"Shared install path with installed application '{other.DisplayName}'";
                     }
+                }
+                // 2. Services, Tasks, App Paths, Firewall, Environment
+                else if (candidate.Kind is CleanupKind.WindowsService or CleanupKind.ScheduledTask
+                         or CleanupKind.EnvironmentEntry or CleanupKind.FirewallRule)
+                {
+                    if (candidate.EvidenceList.Any(e => e.Contains(otherInstall, StringComparison.OrdinalIgnoreCase))
+                        || (!string.IsNullOrEmpty(candidate.EvidencePath) && candidate.EvidencePath.Contains(otherInstall, StringComparison.OrdinalIgnoreCase))
+                        || candidate.Target.Contains(otherInstall, StringComparison.OrdinalIgnoreCase))
+                    {
+                        isShared = true;
+                        sharedReason = $"Shared artifact references path belonging to '{other.DisplayName}'";
+                    }
+                }
+
+                if (isShared)
+                {
+                    candidates[i] = new CleanupCandidate
+                    {
+                        Target = candidate.Target,
+                        Kind = candidate.Kind,
+                        Risk = RiskLevel.High,
+                        Confidence = candidate.Confidence,
+                        Reason = $"[Shared Component] {sharedReason} ({candidate.Reason})",
+                        SizeBytes = candidate.SizeBytes,
+                        RegistryViewName = candidate.RegistryViewName,
+                        Auxiliary = candidate.Auxiliary,
+                        EvidencePath = candidate.EvidencePath,
+                        EvidenceList = candidate.EvidenceList.Concat([$"Shared with installed app: {other.DisplayName}"]).ToList(),
+                        SourceProvider = candidate.SourceProvider,
+                        Scope = candidate.Scope,
+                        AutoSelectable = false,
+                        IsSelected = false
+                    };
+                    break;
                 }
             }
         }
@@ -323,13 +344,8 @@ public sealed partial class CleanupScanner
         if (string.IsNullOrWhiteSpace(rawPath)) return false;
         try
         {
-            var path = Path.GetFullPath(Environment.ExpandEnvironmentVariables(rawPath)).TrimEnd(Path.DirectorySeparatorChar);
-            var rawRoot = Path.GetPathRoot(path);
-            if (string.IsNullOrEmpty(rawRoot) || path.Equals(rawRoot, StringComparison.OrdinalIgnoreCase)) return false;
-            var root = rawRoot.TrimEnd(Path.DirectorySeparatorChar);
-            if (path.Equals(root, StringComparison.OrdinalIgnoreCase)) return false;
-
-            if (CleanupService.IsWithinProtectedWindowsRoot(path)) return false;
+            var raw = Environment.ExpandEnvironmentVariables(rawPath.Trim().Trim('"', '\''));
+            if (CleanupService.IsWithinProtectedWindowsRoot(raw)) return false;
 
             var forbidden = new[]
             {
@@ -341,11 +357,22 @@ public sealed partial class CleanupScanner
                 Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
                 Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
                 Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
-                Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments)
-            }.Where(x => !string.IsNullOrWhiteSpace(x)).Select(x => Path.GetFullPath(x).TrimEnd(Path.DirectorySeparatorChar));
+                Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments),
+                @"C:\Users",
+                @"C:\Windows",
+                @"C:\Program Files",
+                @"C:\Program Files (x86)",
+                @"C:\ProgramData"
+            }.Where(x => !string.IsNullOrWhiteSpace(x)).Select(x => x.TrimEnd('\\', '/'));
 
-            return !forbidden.Contains(path, StringComparer.OrdinalIgnoreCase)
-                && path.Split(Path.DirectorySeparatorChar, StringSplitOptions.RemoveEmptyEntries).Length >= 2;
+            foreach (var f in forbidden)
+            {
+                if (CleanupService.PathEquals(raw, f)) return false;
+            }
+
+            // Path must have at least 2 segments (e.g. C:\Users\Alice is root/user, C:\Users\Alice\AppData\Local\App is specific)
+            return (raw.Contains('\\') || raw.Contains('/'))
+                && raw.Split(new[] { '\\', '/' }, StringSplitOptions.RemoveEmptyEntries).Length >= 2;
         }
         catch { return false; }
     }

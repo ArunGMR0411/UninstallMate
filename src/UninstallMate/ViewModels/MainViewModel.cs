@@ -29,9 +29,9 @@ public sealed class MainViewModel : ObservableObject
     private bool _quietUninstall;
     private bool _createRestorePoint;
     private bool _preserveCleanupBackups = true; // Safe default: recovery enabled
-    private bool _isDeepScan;
     private bool _isCleanupReviewVisible;
     private string _lastSessionFolder = QuarantineService.FindLatestRestorableSession() ?? "";
+    private ApplicationIdentityCaptureResult? _activeCapture;
     private CancellationTokenSource? _operation;
 
     public ObservableCollection<InstalledApplication> Applications { get; } = [];
@@ -104,11 +104,6 @@ public sealed class MainViewModel : ObservableObject
             if (!SetProperty(ref _preserveCleanupBackups, value)) return;
             RaisePropertyChanged(nameof(CleanupActionLabel));
         }
-    }
-    public bool IsDeepScan
-    {
-        get => _isDeepScan;
-        set => SetProperty(ref _isDeepScan, value);
     }
     public bool HasSelection => SelectedApp is not null;
     public bool HasNoSelection => SelectedApp is null;
@@ -216,8 +211,8 @@ public sealed class MainViewModel : ObservableObject
         await RunBusyAsync($"Preparing to uninstall {app.DisplayName}…", async token =>
         {
             Status = $"Capturing pre-uninstall evidence for {app.DisplayName}…";
-            var captureResult = await ApplicationIdentityGraph.CaptureWithDiagnosticsAsync(app, token);
-            _activeIdentity = captureResult.Identity;
+            _activeCapture = await ApplicationIdentityGraph.CaptureWithDiagnosticsAsync(app, token);
+            _activeIdentity = _activeCapture.Identity;
 
             if (CreateRestorePoint) Status = await RestorePointService.TryCreateAsync(app.DisplayName, token);
             Status = $"Running {app.DisplayName}'s uninstaller…";
@@ -258,7 +253,8 @@ public sealed class MainViewModel : ObservableObject
     {
         await RunBusyAsync($"Scanning leftovers for {app.DisplayName}…", async token =>
         {
-            _activeIdentity = await ApplicationIdentityGraph.CaptureAsync(app, token);
+            _activeCapture = await ApplicationIdentityGraph.CaptureWithDiagnosticsAsync(app, token);
+            _activeIdentity = _activeCapture.Identity;
             await ScanCoreAsync(_activeIdentity, token);
         });
     }
@@ -269,9 +265,9 @@ public sealed class MainViewModel : ObservableObject
         var progress = new Progress<string>(p => Status = p);
         var context = new CleanupScanContext
         {
-            IsDeepScan = IsDeepScan,
             InstalledApplications = Applications.ToList(),
-            PreUninstallIdentity = identity
+            PreUninstallIdentity = identity,
+            PreUninstallCaptureResult = _activeCapture
         };
 
         var scanResult = await _scanner.ScanWithDetailsAsync(identity, context, progress, token);
@@ -324,6 +320,18 @@ public sealed class MainViewModel : ObservableObject
                     && x.Auxiliary == completed.Auxiliary
                     && x.EvidencePath == completed.EvidencePath);
                 if (candidate is not null) CleanupCandidates.Remove(candidate);
+            }
+
+            // Add pre-uninstall identity capture diagnostics to final report
+            if (_activeCapture?.Diagnostics is not null)
+            {
+                foreach (var diag in _activeCapture.Diagnostics)
+                {
+                    if (!report.Diagnostics.Any(d => d.ProviderName == diag.ProviderName && d.Message == diag.Message))
+                    {
+                        report.Diagnostics.Add(diag);
+                    }
+                }
             }
 
             // Run post-clean verification scan!

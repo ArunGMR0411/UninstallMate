@@ -13,12 +13,14 @@
     <Compile Include="..\..\src\UninstallMate\Models\InstalledApplication.cs" Link="InstalledApplication.cs" />
     <Compile Include="..\..\src\UninstallMate\Models\CleanupCandidate.cs" Link="CleanupCandidate.cs" />
     <Compile Include="..\..\src\UninstallMate\Models\OwnershipConfidence.cs" Link="OwnershipConfidence.cs" />
+    <Compile Include="..\..\src\UninstallMate\Models\ScanStatusAccumulator.cs" Link="ScanStatusAccumulator.cs" />
     <Compile Include="..\..\src\UninstallMate\Models\ProviderScanResult.cs" Link="ProviderScanResult.cs" />
     <Compile Include="..\..\src\UninstallMate\Models\ApplicationIdentityGraph.cs" Link="ApplicationIdentityGraph.cs" />
     <Compile Include="..\..\src\UninstallMate\Models\TrackedInstallManifest.cs" Link="TrackedInstallManifest.cs" />
     <Compile Include="..\..\src\UninstallMate\Models\OperationResult.cs" Link="OperationResult.cs" />
     <Compile Include="..\..\src\UninstallMate\Services\CommandLineParser.cs" Link="CommandLineParser.cs" />
     <Compile Include="..\..\src\UninstallMate\Services\AppDiscoveryService.cs" Link="AppDiscoveryService.cs" />
+    <Compile Include="..\..\src\UninstallMate\Services\ToolRunner.cs" Link="ToolRunner.cs" />
     <Compile Include="..\..\src\UninstallMate\Services\CleanupScanner.cs" Link="CleanupScanner.cs" />
     <Compile Include="..\..\src\UninstallMate\Services\CleanupService.cs" Link="CleanupService.cs" />
     <Compile Include="..\..\src\UninstallMate\Services\QuarantineService.cs" Link="QuarantineService.cs" />

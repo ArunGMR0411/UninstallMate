@@ -60,54 +60,8 @@ public sealed class VerificationService
 
         var scanResult = await _scanner.ScanWithDetailsAsync(identity, context, progress, token);
         var remaining = scanResult.Candidates;
-        var hasProviderFailure = scanResult.Status is ScanStatus.Failed or ScanStatus.AccessDenied or ScanStatus.Partial;
 
-        // 4. Calculate outcome
-        VerificationOutcome outcome;
-        string message;
-
-        if (hasProviderFailure)
-        {
-            outcome = VerificationOutcome.ScanIncomplete;
-            message = $"Verification scan incomplete: one or more providers reported status '{scanResult.Status}'.";
-        }
-        else if (failedItems.Count > 0)
-        {
-            outcome = VerificationOutcome.CleanupIncomplete;
-            message = $"Cleanup completed with {failedItems.Count} item(s) that could not be removed.";
-        }
-        else if (stillInstalled)
-        {
-            outcome = VerificationOutcome.VerificationIncomplete;
-            message = "Windows still reports an application registration in inventory.";
-        }
-        else if (remaining.Count == 0)
-        {
-            if (restartPending)
-            {
-                outcome = VerificationOutcome.CleanAfterRestart;
-                message = "Clean after restart: all live application remnants removed; locked items are scheduled for restart deletion.";
-            }
-            else
-            {
-                outcome = VerificationOutcome.Clean;
-                message = "Clean: verified that all application registrations, startup entries, services, and remnants have been removed.";
-            }
-        }
-        else
-        {
-            var hasAutoSelectableRemaining = remaining.Any(r => r.Confidence.IsAtLeast(OwnershipConfidence.High) && r.Risk == RiskLevel.Low);
-            if (hasAutoSelectableRemaining)
-            {
-                outcome = VerificationOutcome.CleanupIncomplete;
-                message = $"Verification found {remaining.Count} remaining leftover item(s).";
-            }
-            else
-            {
-                outcome = VerificationOutcome.ResidualItemsRequireReview;
-                message = $"Verification complete: {remaining.Count} medium/high-risk or optional items remain for review.";
-            }
-        }
+        var (outcome, message) = DetermineOutcome(cleanupReport, stillInstalled, scanResult);
 
         cleanupReport.FinalStatus = outcome.ToString();
         cleanupReport.RestartRequired = restartPending;
@@ -129,5 +83,45 @@ public sealed class VerificationService
             RestartRequired = restartPending,
             InventoryStillPresent = stillInstalled
         };
+    }
+
+    public static (VerificationOutcome Outcome, string Message) DetermineOutcome(
+        CleanupReport cleanupReport,
+        bool stillInstalled,
+        ScanExecutionResult scanResult)
+    {
+        var failedItems = cleanupReport.Items.Where(x => !x.Success).ToList();
+        var restartPending = cleanupReport.RestartRequired
+            || cleanupReport.Items.Any(x => x.VerificationStatus == "PendingReboot" || x.Detail.Contains("reboot", StringComparison.OrdinalIgnoreCase));
+        var remaining = scanResult.Candidates;
+        var hasProviderFailure = scanResult.Status is ScanStatus.Failed or ScanStatus.AccessDenied or ScanStatus.Partial;
+
+        if (hasProviderFailure)
+        {
+            return (VerificationOutcome.ScanIncomplete, $"Verification scan incomplete: one or more providers reported status '{scanResult.Status}'.");
+        }
+        if (failedItems.Count > 0)
+        {
+            return (VerificationOutcome.CleanupIncomplete, $"Cleanup completed with {failedItems.Count} item(s) that could not be removed.");
+        }
+        if (stillInstalled)
+        {
+            return (VerificationOutcome.VerificationIncomplete, "Windows still reports an application registration in inventory.");
+        }
+        if (remaining.Count == 0)
+        {
+            if (restartPending)
+            {
+                return (VerificationOutcome.CleanAfterRestart, "Clean after restart: all live application remnants removed; locked items are scheduled for restart deletion.");
+            }
+            return (VerificationOutcome.Clean, "Clean: verified that all application registrations, startup entries, services, and remnants have been removed.");
+        }
+
+        var hasAutoSelectableRemaining = remaining.Any(r => r.Confidence.IsAtLeast(OwnershipConfidence.High) && r.Risk == RiskLevel.Low);
+        if (hasAutoSelectableRemaining)
+        {
+            return (VerificationOutcome.CleanupIncomplete, $"Verification found {remaining.Count} remaining leftover item(s).");
+        }
+        return (VerificationOutcome.ResidualItemsRequireReview, $"Verification complete: {remaining.Count} medium/high-risk or optional items remain for review.");
     }
 }

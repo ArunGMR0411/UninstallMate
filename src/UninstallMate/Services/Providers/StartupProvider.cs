@@ -7,6 +7,8 @@ namespace UninstallMate.Services.Providers;
 
 public sealed class StartupProvider : ICleanupArtifactProvider
 {
+    private static readonly IShortcutResolver ShortcutResolver = new WindowsShortcutResolver();
+
     public string Name => "StartupEntries";
 
     public async Task<ProviderScanResult> ScanAsync(
@@ -17,6 +19,7 @@ public sealed class StartupProvider : ICleanupArtifactProvider
         var sw = Stopwatch.StartNew();
         var candidates = new List<CleanupCandidate>();
         var diagnostics = new List<ScanDiagnostic>();
+        var statusAcc = new ScanStatusAccumulator();
 
         if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
         {
@@ -27,20 +30,21 @@ public sealed class StartupProvider : ICleanupArtifactProvider
         {
             try
             {
-                ScanRunSubKeys(identity, context, candidates, diagnostics, token);
-                ScanStartupFolder(identity, context, candidates, diagnostics, token);
-                ScanStartupApprovedSubKeys(identity, context, candidates, diagnostics, token);
+                ScanRunSubKeys(identity, context, candidates, diagnostics, statusAcc, token);
+                ScanStartupFolder(identity, context, candidates, diagnostics, statusAcc, token);
+                ScanStartupApprovedSubKeys(identity, context, candidates, diagnostics, statusAcc, token);
             }
             catch (Exception ex)
             {
                 diagnostics.Add(new ScanDiagnostic(Name, $"Error during startup scan: {ex.Message}", IsError: true, ExceptionDetail: ex.ToString()));
+                statusAcc.MarkFailed();
             }
         }, token);
 
         return new ProviderScanResult
         {
             ProviderName = Name,
-            Status = diagnostics.Any(d => d.IsError) ? ScanStatus.CompleteWithWarnings : ScanStatus.Complete,
+            Status = statusAcc.Status,
             Candidates = candidates,
             Diagnostics = diagnostics,
             Elapsed = sw.Elapsed
@@ -52,6 +56,7 @@ public sealed class StartupProvider : ICleanupArtifactProvider
         CleanupScanContext context,
         List<CleanupCandidate> candidates,
         List<ScanDiagnostic> diagnostics,
+        ScanStatusAccumulator statusAcc,
         CancellationToken token)
     {
         var runLocations = new[]
@@ -84,22 +89,14 @@ public sealed class StartupProvider : ICleanupArtifactProvider
 
                         var confidence = pathMatch ? OwnershipConfidence.Certain : OwnershipConfidence.Medium;
                         var risk = pathMatch ? RiskLevel.Low : RiskLevel.Medium;
-                        var autoSelect = CleanupSelectionPolicy.ShouldAutoSelect(new CleanupCandidate
-                        {
-                            Target = $@"{hiveText}\{subKey}",
-                            Kind = CleanupKind.RegistryValue,
-                            Risk = risk,
-                            Confidence = confidence,
-                            Reason = "",
-                            AutoSelectable = pathMatch
-                        });
+                        var autoSelect = pathMatch;
 
                         var target = $@"{hiveText}\{subKey}";
                         var reason = pathMatch
                             ? $"Startup entry launches application binary from '{command}'"
                             : $"Startup entry name '{valueName}' matches application name; command requires review";
 
-                        candidates.Add(new CleanupCandidate
+                        var candidate = new CleanupCandidate
                         {
                             Target = target,
                             Auxiliary = valueName,
@@ -112,19 +109,22 @@ public sealed class StartupProvider : ICleanupArtifactProvider
                             SourceProvider = Name,
                             RegistryValueKindName = "String",
                             RegistryRawValueBase64 = command,
-                            AutoSelectable = pathMatch,
-                            EvidenceList = [$"Command: {command}", $"View: {viewName}-bit"],
-                            IsSelected = autoSelect
-                        });
+                            AutoSelectable = autoSelect,
+                            EvidenceList = [$"Command: {command}", $"View: {viewName}-bit"]
+                        };
+                        candidate.IsSelected = CleanupSelectionPolicy.ShouldAutoSelect(candidate);
+                        candidates.Add(candidate);
                     }
                 }
                 catch (UnauthorizedAccessException ex)
                 {
                     diagnostics.Add(new ScanDiagnostic(Name, $"Access denied reading {hiveText}\\{subKey}", IsWarning: true, TargetPath: $@"{hiveText}\{subKey}", ExceptionDetail: ex.Message));
+                    statusAcc.MarkAccessDenied();
                 }
                 catch (Exception ex)
                 {
                     diagnostics.Add(new ScanDiagnostic(Name, $"Failed scanning {hiveText}\\{subKey}: {ex.Message}", IsWarning: true, TargetPath: $@"{hiveText}\{subKey}", ExceptionDetail: ex.Message));
+                    statusAcc.MarkWarning();
                 }
             }
         }
@@ -135,9 +135,9 @@ public sealed class StartupProvider : ICleanupArtifactProvider
         CleanupScanContext context,
         List<CleanupCandidate> candidates,
         List<ScanDiagnostic> diagnostics,
+        ScanStatusAccumulator statusAcc,
         CancellationToken token)
     {
-        var shortcutResolver = new WindowsShortcutResolver();
         var startupFolders = new[]
         {
             (Environment.GetFolderPath(Environment.SpecialFolder.Startup), CleanupScope.User),
@@ -154,7 +154,7 @@ public sealed class StartupProvider : ICleanupArtifactProvider
                     token.ThrowIfCancellationRequested();
                     var name = Path.GetFileNameWithoutExtension(file);
                     var resolution = file.EndsWith(".lnk", StringComparison.OrdinalIgnoreCase)
-                        ? shortcutResolver.Resolve(file)
+                        ? ShortcutResolver.Resolve(file)
                         : ShortcutResolution.Empty;
 
                     var targetPath = resolution.HasTarget ? resolution.TargetPath : file;
@@ -165,8 +165,9 @@ public sealed class StartupProvider : ICleanupArtifactProvider
 
                     var confidence = pathMatch ? OwnershipConfidence.Certain : OwnershipConfidence.Medium;
                     var risk = pathMatch ? RiskLevel.Low : RiskLevel.Medium;
+                    var autoSelect = pathMatch;
 
-                    candidates.Add(new CleanupCandidate
+                    var candidate = new CleanupCandidate
                     {
                         Target = file,
                         Kind = CleanupKind.File,
@@ -177,15 +178,22 @@ public sealed class StartupProvider : ICleanupArtifactProvider
                             ? $"Startup folder shortcut targets application binary '{targetPath}'"
                             : $"Startup folder item '{name}' matches application name",
                         SourceProvider = Name,
-                        AutoSelectable = pathMatch,
-                        EvidenceList = [$"Target: {targetPath}"],
-                        IsSelected = pathMatch
-                    });
+                        AutoSelectable = autoSelect,
+                        EvidenceList = [$"Target: {targetPath}"]
+                    };
+                    candidate.IsSelected = CleanupSelectionPolicy.ShouldAutoSelect(candidate);
+                    candidates.Add(candidate);
                 }
+            }
+            catch (UnauthorizedAccessException ex)
+            {
+                diagnostics.Add(new ScanDiagnostic(Name, $"Access denied scanning startup folder {folder}: {ex.Message}", IsWarning: true, TargetPath: folder));
+                statusAcc.MarkAccessDenied();
             }
             catch (Exception ex)
             {
                 diagnostics.Add(new ScanDiagnostic(Name, $"Failed scanning startup folder {folder}: {ex.Message}", IsWarning: true, TargetPath: folder));
+                statusAcc.MarkWarning();
             }
         }
     }
@@ -195,6 +203,7 @@ public sealed class StartupProvider : ICleanupArtifactProvider
         CleanupScanContext context,
         List<CleanupCandidate> candidates,
         List<ScanDiagnostic> diagnostics,
+        ScanStatusAccumulator statusAcc,
         CancellationToken token)
     {
         var approvedLocations = new[]
@@ -221,16 +230,28 @@ public sealed class StartupProvider : ICleanupArtifactProvider
 
                     foreach (var valueName in key.GetValueNames())
                     {
-                        var correlationKey = new StartupCorrelationKey(hiveName, view, kind, valueName);
+                        var cleanValueName = valueName.EndsWith(".lnk", StringComparison.OrdinalIgnoreCase)
+                            ? Path.GetFileNameWithoutExtension(valueName)
+                            : valueName;
+
+                        var viewToCheck = kind == StartupSourceKind.StartupFolder ? (RegistryView?)null : view;
+                        var correlationKey = new StartupCorrelationKey(hiveName, kind, valueName, viewToCheck);
+                        var correlationKeyClean = new StartupCorrelationKey(hiveName, kind, cleanValueName, viewToCheck);
 
                         // Safe Correlation Requirement:
                         // 1. Must match exact correlation key against a pre-uninstall startup source captured with High/Certain confidence
                         var matchingSource = identity.CapturedStartupSources.FirstOrDefault(s =>
-                            s.CorrelationKey == correlationKey
+                            (s.CorrelationKey == correlationKey || s.CorrelationKey == correlationKeyClean
+                             || (s.CorrelationKey.Hive == hiveName && s.CorrelationKey.Kind == kind
+                                 && (s.CorrelationKey.ValueName.Equals(valueName, StringComparison.OrdinalIgnoreCase)
+                                     || s.CorrelationKey.ValueName.Equals(cleanValueName, StringComparison.OrdinalIgnoreCase))
+                                 && (kind == StartupSourceKind.StartupFolder || s.CorrelationKey.View == view)))
                             && s.Confidence.IsAtLeast(OwnershipConfidence.High));
 
                         // 2. Or fallback name match (strictly Medium confidence, not auto-selected)
-                        var nameMatch = identity.CandidateNames.Any(c => c.Equals(valueName, StringComparison.OrdinalIgnoreCase));
+                        var nameMatch = identity.CandidateNames.Any(c =>
+                            c.Equals(valueName, StringComparison.OrdinalIgnoreCase)
+                            || c.Equals(cleanValueName, StringComparison.OrdinalIgnoreCase));
 
                         if (matchingSource is null && !nameMatch) continue;
 
@@ -253,7 +274,7 @@ public sealed class StartupProvider : ICleanupArtifactProvider
                             evidence.Add($"Pre-uninstall correlated source: {matchingSource.RegistryPath} ({matchingSource.CommandOrShortcutPath})");
                         }
 
-                        candidates.Add(new CleanupCandidate
+                        var candidate = new CleanupCandidate
                         {
                             Target = target,
                             Auxiliary = valueName,
@@ -267,18 +288,21 @@ public sealed class StartupProvider : ICleanupArtifactProvider
                             RegistryValueKindName = "Binary",
                             RegistryRawValueBase64 = rawBase64,
                             AutoSelectable = autoSelect,
-                            EvidenceList = evidence,
-                            IsSelected = autoSelect
-                        });
+                            EvidenceList = evidence
+                        };
+                        candidate.IsSelected = CleanupSelectionPolicy.ShouldAutoSelect(candidate);
+                        candidates.Add(candidate);
                     }
                 }
                 catch (UnauthorizedAccessException ex)
                 {
                     diagnostics.Add(new ScanDiagnostic(Name, $"Access denied reading StartupApproved key {hiveText}\\{subKey}", IsWarning: true, TargetPath: $@"{hiveText}\{subKey}", ExceptionDetail: ex.Message));
+                    statusAcc.MarkAccessDenied();
                 }
                 catch (Exception ex)
                 {
                     diagnostics.Add(new ScanDiagnostic(Name, $"Failed scanning StartupApproved in {hiveText}\\{subKey}: {ex.Message}", IsWarning: true, TargetPath: $@"{hiveText}\{subKey}", ExceptionDetail: ex.Message));
+                    statusAcc.MarkWarning();
                 }
             }
         }

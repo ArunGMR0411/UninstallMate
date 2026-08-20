@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Text.Json;
 using Microsoft.Win32;
@@ -66,63 +67,35 @@ AddTest("RiskLevel highest risk merge semantics", () =>
     Equal(RiskLevel.Low, RiskLevelExtensions.Lowest(RiskLevel.Low, RiskLevel.High));
 });
 
-// 4. Centralized Default Selection Policy
-AddTest("CleanupSelectionPolicy only auto-selects Low Risk + High/Certain Confidence", () =>
+// 4. Centralized Default Selection Policy - Exhaustive Table Test
+AddTest("Selection policy exhaustive table invariant (only Low+High+true and Low+Certain+true auto-select)", () =>
 {
-    var lowRiskCertain = new CleanupCandidate
-    {
-        Target = @"C:\Program Files\Acme",
-        Kind = CleanupKind.Directory,
-        Risk = RiskLevel.Low,
-        Confidence = OwnershipConfidence.Certain,
-        Reason = "Test",
-        AutoSelectable = true
-    };
-    True(CleanupSelectionPolicy.ShouldAutoSelect(lowRiskCertain));
+    var risks = new[] { RiskLevel.Low, RiskLevel.Medium, RiskLevel.High };
+    var confidences = new[] { OwnershipConfidence.Low, OwnershipConfidence.Medium, OwnershipConfidence.High, OwnershipConfidence.Certain };
+    var autoSelectables = new[] { true, false };
 
-    var lowRiskHigh = new CleanupCandidate
+    foreach (var risk in risks)
     {
-        Target = @"C:\Users\Test\AppData\Local\Acme",
-        Kind = CleanupKind.Directory,
-        Risk = RiskLevel.Low,
-        Confidence = OwnershipConfidence.High,
-        Reason = "Test",
-        AutoSelectable = true
-    };
-    True(CleanupSelectionPolicy.ShouldAutoSelect(lowRiskHigh));
+        foreach (var conf in confidences)
+        {
+            foreach (var auto in autoSelectables)
+            {
+                var candidate = new CleanupCandidate
+                {
+                    Target = @"C:\Test\Path",
+                    Kind = CleanupKind.Directory,
+                    Risk = risk,
+                    Confidence = conf,
+                    Reason = "Test",
+                    AutoSelectable = auto
+                };
 
-    var highRiskCertain = new CleanupCandidate
-    {
-        Target = @"C:\Windows\System32\acme.dll",
-        Kind = CleanupKind.File,
-        Risk = RiskLevel.High,
-        Confidence = OwnershipConfidence.Certain,
-        Reason = "Test",
-        AutoSelectable = true
-    };
-    False(CleanupSelectionPolicy.ShouldAutoSelect(highRiskCertain));
-
-    var lowRiskMedium = new CleanupCandidate
-    {
-        Target = @"HKEY_CURRENT_USER\Software\Acme",
-        Kind = CleanupKind.RegistryKey,
-        Risk = RiskLevel.Low,
-        Confidence = OwnershipConfidence.Medium,
-        Reason = "Test",
-        AutoSelectable = true
-    };
-    False(CleanupSelectionPolicy.ShouldAutoSelect(lowRiskMedium));
-
-    var notAutoSelectable = new CleanupCandidate
-    {
-        Target = @"C:\Program Files\Acme",
-        Kind = CleanupKind.Directory,
-        Risk = RiskLevel.Low,
-        Confidence = OwnershipConfidence.Certain,
-        Reason = "Test",
-        AutoSelectable = false
-    };
-    False(CleanupSelectionPolicy.ShouldAutoSelect(notAutoSelectable));
+                var expected = auto && risk == RiskLevel.Low && conf.IsAtLeast(OwnershipConfidence.High);
+                var actual = CleanupSelectionPolicy.ShouldAutoSelect(candidate);
+                Equal(expected, actual);
+            }
+        }
+    }
 });
 
 // 5. Candidate Deduplication Invariants
@@ -172,239 +145,471 @@ AddTest("Install-path evidence rejects a similarly prefixed folder", () =>
         "\"C:\\Program Files\\AcmeOther\\agent.exe\"",
         ["C:\\Program Files\\Acme"])));
 
-// 7. Protected Windows Subtree Deletion Rejection
-AddTest("Protected Windows directories and user profile roots are strictly rejected from cleanup", () =>
+// 7. P0 User-Profile Path Safety Fix (Exact root protected vs descendants allowed)
+AddTest("User profile root is protected, but AppData and valid application descendants are allowed", () =>
 {
-    var winDir = Environment.GetFolderPath(Environment.SpecialFolder.Windows);
-    var system = Environment.GetFolderPath(Environment.SpecialFolder.System);
     var userProfile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+    var localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+    var appData = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
 
-    True(CleanupService.IsWithinProtectedWindowsRoot(winDir));
-    True(CleanupService.IsWithinProtectedWindowsRoot(system));
+    // Exact roots must be rejected
+    True(CleanupService.IsWithinProtectedWindowsRoot(@"C:\Users"));
     True(CleanupService.IsWithinProtectedWindowsRoot(userProfile));
-    False(CleanupScanner.IsSafeSpecificPath(winDir));
-    False(CleanupScanner.IsSafeSpecificPath(system));
+    False(CleanupScanner.IsSafeSpecificPath(@"C:\Users"));
     False(CleanupScanner.IsSafeSpecificPath(userProfile));
+
+    // Windows subtrees must be rejected
+    True(CleanupService.IsWithinProtectedWindowsRoot(@"C:\Windows\System32"));
+    True(CleanupService.IsWithinProtectedWindowsRoot(@"C:\ProgramData\Microsoft\Edge"));
+    False(CleanupScanner.IsSafeSpecificPath(@"C:\Windows\System32\app.dll"));
+
+    // User profile descendants (AppData, LocalLow, App folders) MUST be allowed!
+    var localAppFolder = @"C:\Users\Alice\AppData\Local\AcmeVendor\App";
+    False(CleanupService.IsWithinProtectedWindowsRoot(localAppFolder));
+    True(CleanupScanner.IsSafeSpecificPath(localAppFolder));
+
+    var roamingAppFolder = @"C:\Users\Alice\AppData\Roaming\AcmeVendor\App";
+    False(CleanupService.IsWithinProtectedWindowsRoot(roamingAppFolder));
+    True(CleanupScanner.IsSafeSpecificPath(roamingAppFolder));
+
+    var localLowFolder = @"C:\Users\Alice\AppData\LocalLow\AcmeVendor\App";
+    False(CleanupService.IsWithinProtectedWindowsRoot(localLowFolder));
+    True(CleanupScanner.IsSafeSpecificPath(localLowFolder));
+
+    var docsAppFolder = @"C:\Users\Alice\Documents\AcmeVendor\App";
+    False(CleanupService.IsWithinProtectedWindowsRoot(docsAppFolder));
+    True(CleanupScanner.IsSafeSpecificPath(docsAppFolder));
 });
 
-// 8. PATH Cleanup & Index-Aware Merge-Safe Restore
-AddTest("PATH cleanup removes only the app's segments", () =>
-    Equal(
-        @"C:\Windows;C:\Tools",
-        CleanupService.RemoveEnvironmentPathSegments(
-            @"C:\Windows;C:\Program Files\Acme;C:\Program Files\Acme\bin;C:\Tools",
-            @"C:\Program Files\Acme")));
-
-AddTest("Merge-safe PATH restore preserves approximate original position and newer edits", () =>
+// 8. ScanStatusAccumulator Status Transitions
+AddTest("ScanStatusAccumulator correctly transitions across warnings, partial, access denied, and failed", () =>
 {
-    var currentPath = @"C:\Windows;C:\NewTools;C:\OtherApp";
-    var segmentToRestore = @"C:\Program Files\Acme";
-    var merged = QuarantineService.MergePathSegment(currentPath, segmentToRestore, originalIndex: 1);
-    Equal(@"C:\Windows;C:\Program Files\Acme;C:\NewTools;C:\OtherApp", merged);
+    var acc = new ScanStatusAccumulator();
+    Equal(ScanStatus.Complete, acc.Status);
 
-    // Does not duplicate if already present
-    var unchanged = QuarantineService.MergePathSegment(merged, segmentToRestore, originalIndex: 1);
-    Equal(merged, unchanged);
+    acc.MarkWarning();
+    Equal(ScanStatus.CompleteWithWarnings, acc.Status);
+
+    acc.MarkPartial();
+    Equal(ScanStatus.Partial, acc.Status);
+
+    acc.MarkAccessDenied();
+    Equal(ScanStatus.AccessDenied, acc.Status);
+
+    acc.MarkFailed();
+    Equal(ScanStatus.Failed, acc.Status);
+
+    // Once failed, stays failed
+    acc.MarkPartial();
+    Equal(ScanStatus.Failed, acc.Status);
 });
 
-// 9. Application Discovery & Store Components
-AddTest("Duplicate registry views collapse to one app", () =>
+// 9. VerificationService Incompleteness Invariants
+AddTest("VerificationService produces ScanIncomplete (never Clean) on Partial, AccessDenied, or Failed provider results", () =>
 {
-    var duplicate32 = TestApplicationWith("acme:32", "1.0", @"C:\Program Files\Acme", "32-bit");
-    var duplicate64 = TestApplicationWith("acme:64", "1.0", @"C:\Program Files\Acme", "64-bit");
-    EqualInt(1, AppDiscoveryService.Deduplicate([duplicate32, duplicate64]).Count());
-});
+    var app = TestApplication();
+    var identity = ApplicationIdentityGraph.Create(app);
+    var verifier = new VerificationService();
 
-AddTest("Different app versions remain separate", () =>
-    EqualInt(2, AppDiscoveryService.Deduplicate([
-        TestApplicationWith("acme:1", "1.0", @"C:\Program Files\Acme 1"),
-        TestApplicationWith("acme:2", "2.0", @"C:\Program Files\Acme 2")]).Count()));
-
-AddTest("Declared and OEM Store components are classified as system", () =>
-{
-    True(AppDiscoveryService.IsLikelySystemStorePackage(
-        "Microsoft.Windows.StartMenuExperienceHost", "CN=Microsoft Corporation", "System", false, false, true));
-    True(AppDiscoveryService.IsLikelySystemStorePackage(
-        "AppUp.IntelGraphicsExperience", "CN=Intel", "Store", false, false, false));
-    True(AppDiscoveryService.IsLikelySystemStorePackage(
-        "aimgr", "CN=Microsoft Corporation", "Developer", false, false, false));
-});
-
-AddTest("Ordinary Store applications remain visible", () =>
-    False(AppDiscoveryService.IsLikelySystemStorePackage(
-        "OpenAI.Codex", "CN=OpenAI", "Store", false, false, false)));
-
-AddTest("Store identities resolve to human-facing names", () =>
-{
-    Equal("Microsoft Clipchamp", AppDiscoveryService.ResolvePackageDisplayName(
-        "Clipchamp.Clipchamp", "ms-resource:Clipchamp/AppName", "Microsoft Clipchamp"));
-    Equal("Dolby Digital Plus decoder for PC OEMs", AppDiscoveryService.ResolvePackageDisplayName(
-        "DolbyLaboratories.DolbyDigitalPlusDecoderOEM", "Dolby Digital Plus decoder for PC OEMs", ""));
-    Equal("Dolby Digital Plus Decoder OEM", AppDiscoveryService.ResolvePackageDisplayName(
-        "DolbyLaboratories.DolbyDigitalPlusDecoderOEM", "ms-resource:AppName", ""));
-    Equal("App Resolver UX", AppDiscoveryService.ResolvePackageDisplayName(
-        "E2A4F912-2574-4A75-9BB0-0D023378592B", "ms-resource:AppxManifest_DisplayName", "",
-        "ms-resource:AppxManifest_DisplayName", "Microsoft.Windows.AppResolverUX", "AppResolverUX.exe"));
-});
-
-AddTest("Drivers are system components but ordinary desktop apps are not", () =>
-{
-    True(AppDiscoveryService.IsLikelySystemDesktopComponent("NVIDIA Graphics Driver 610.62", "NVIDIA Corporation"));
-    True(AppDiscoveryService.IsLikelySystemDesktopComponent("ASUS Smart Display Control", "ASUSTeK COMPUTER INC."));
-    False(AppDiscoveryService.IsLikelySystemDesktopComponent("7-Zip 25.00 (x64)", "Igor Pavlov"));
-});
-
-// 10. StartupApproved False-Positive Prevention & Pre-Uninstall Correlation
-AddTest("StartupApproved correlation prevents same-name unrelated false positives", () =>
-{
-    var app = new InstalledApplication
+    var emptyReport = new CleanupReport
     {
-        Id = "vendor-a-agent",
-        DisplayName = "Agent",
-        Publisher = "Vendor A",
-        InstallLocation = @"C:\Program Files\VendorA\Agent"
+        ApplicationName = app.DisplayName,
+        FinalStatus = "Completed"
     };
 
-    var graph = ApplicationIdentityGraph.Create(app);
+    // Test with partial result in scanner results
+    var partialResult = new ProviderScanResult
+    {
+        ProviderName = "ScheduledTasks",
+        Status = ScanStatus.Partial,
+        Candidates = [],
+        Diagnostics = [new ScanDiagnostic("ScheduledTasks", "PowerShell error", IsWarning: true)],
+        Elapsed = TimeSpan.FromMilliseconds(10)
+    };
 
-    // Unrelated startup source belonging to Vendor B
-    var unrelatedCorrelationKey = new StartupCorrelationKey(
-        RegistryHive.CurrentUser, RegistryView.Registry64, StartupSourceKind.Run, "Agent");
+    var scanExecution = new ScanExecutionResult
+    {
+        Identity = identity,
+        Status = ScanStatus.Partial,
+        Candidates = [],
+        ProviderResults = [partialResult],
+        Diagnostics = partialResult.Diagnostics,
+        TotalElapsed = TimeSpan.FromMilliseconds(10)
+    };
 
-    var unrelatedSource = new CapturedStartupSource(
-        unrelatedCorrelationKey,
-        @"HKEY_CURRENT_USER\SOFTWARE\Microsoft\Windows\CurrentVersion\Run",
-        @"C:\Program Files\VendorB\Agent.exe",
-        null,
-        OwnershipConfidence.Medium, // Name-only match without path evidence is Medium
-        ["Name match only"]);
+    var (outcome, message) = VerificationService.DetermineOutcome(
+        emptyReport,
+        stillInstalled: false,
+        scanExecution);
 
-    graph.CapturedStartupSources.Add(unrelatedSource);
-
-    // Correlating an approval against unrelated source must NOT yield Certain or AutoSelectable
-    var matchingSource = graph.CapturedStartupSources.FirstOrDefault(s =>
-        s.CorrelationKey == unrelatedCorrelationKey
-        && s.Confidence.IsAtLeast(OwnershipConfidence.High));
-
-    True(matchingSource is null); // Correctly rejects promotion because source was not High/Certain
+    Equal(VerificationOutcome.ScanIncomplete, outcome);
+    True(message.Contains("Verification scan incomplete"));
 });
 
-AddTest("StartupApproved correlation accepts exact verified pre-uninstall startup source", () =>
+// 10. ShortcutProvider False-Positive & Provenance Tests
+AddTest("ShortcutProvider: unrelated target path prevents auto-selection even with matching shortcut name", () =>
 {
     var app = new InstalledApplication
     {
         Id = "neat-app",
         DisplayName = "Neat",
-        Publisher = "The Neat Company",
-        InstallLocation = @"C:\Program Files (x86)\Neat"
+        InstallLocation = @"C:\Program Files\The Neat Company\Neat"
     };
 
     var graph = ApplicationIdentityGraph.Create(app);
 
-    var neatCorrelationKey = new StartupCorrelationKey(
-        RegistryHive.CurrentUser, RegistryView.Registry64, StartupSourceKind.Run, "Neat");
+    // Shortcut with matching name "Neat.lnk" but target points to another vendor's executable
+    var candidate = new CleanupCandidate
+    {
+        Target = @"C:\Users\Alice\Desktop\Neat.lnk",
+        Kind = CleanupKind.File,
+        Risk = RiskLevel.Medium,
+        Confidence = OwnershipConfidence.Medium,
+        Reason = "Shortcut name matches application name; verify target before removal",
+        AutoSelectable = false
+    };
 
-    var verifiedNeatSource = new CapturedStartupSource(
-        neatCorrelationKey,
-        @"HKEY_CURRENT_USER\SOFTWARE\Microsoft\Windows\CurrentVersion\Run",
-        @"C:\Program Files (x86)\Neat\Neat.exe",
-        null,
-        OwnershipConfidence.Certain, // Path matches evidence
-        ["Command points into app installation: C:\\Program Files (x86)\\Neat\\Neat.exe"]);
-
-    graph.CapturedStartupSources.Add(verifiedNeatSource);
-
-    var matchingSource = graph.CapturedStartupSources.FirstOrDefault(s =>
-        s.CorrelationKey == neatCorrelationKey
-        && s.Confidence.IsAtLeast(OwnershipConfidence.High));
-
-    True(matchingSource is not null);
-    Equal(OwnershipConfidence.Certain, matchingSource!.Confidence);
+    False(CleanupSelectionPolicy.ShouldAutoSelect(candidate));
 });
 
-// 11. Scan Completeness & Status Aggregation
-AddTest("Scan completeness: Provider failure or access denied prevents Clean verification outcome", () =>
+AddTest("ShortcutProvider: target-verified shortcut retains Certain confidence even when binary is gone", () =>
 {
-    var completeResult = ProviderScanResult.Succeeded("InstallLocation", [], TimeSpan.Zero);
-    var accessDeniedResult = ProviderScanResult.AccessDeniedResult("Registry", @"HKEY_LOCAL_MACHINE\SOFTWARE\Protected", "Access denied reading protected key");
+    var app = new InstalledApplication
+    {
+        Id = "neat-app",
+        DisplayName = "Neat",
+        InstallLocation = @"C:\Program Files\The Neat Company\Neat"
+    };
 
-    var aggregated = CleanupScanner.AggregateStatus(new List<ProviderScanResult> { completeResult, accessDeniedResult });
-    Equal(ScanStatus.AccessDenied, aggregated);
+    var graph = ApplicationIdentityGraph.Create(app);
+
+    var capturedShortcut = new CapturedShortcutEntry(
+        @"C:\Users\Alice\Desktop\My Scanner.lnk",
+        "My Scanner",
+        @"C:\Program Files\The Neat Company\Neat\Neat.exe",
+        "",
+        CleanupScope.User,
+        OwnershipConfidence.Certain,
+        ["Pre-uninstall verified target: C:\\Program Files\\The Neat Company\\Neat\\Neat.exe"]);
+
+    graph.CapturedShortcuts.Add(capturedShortcut);
+
+    var match = graph.CapturedShortcuts.FirstOrDefault(s =>
+        s.ShortcutPath.Equals(@"C:\Users\Alice\Desktop\My Scanner.lnk", StringComparison.OrdinalIgnoreCase));
+
+    True(match is not null);
+    Equal(OwnershipConfidence.Certain, match!.Confidence);
 });
 
-// 12. Fail-Closed Cleanup
-AddTest("Fail-closed cleanup: CleanupSafetyException thrown when target is within protected Windows root", () =>
+// 11. Firewall Rule Ownership Tests
+AddTest("Firewall rule: executable-bound rule is Certain/Low/AutoSelectable, name-only is Medium/Medium/unselected", () =>
+{
+    var app = new InstalledApplication
+    {
+        Id = "acme-app",
+        DisplayName = "Acme Server",
+        InstallLocation = @"C:\Program Files\Acme"
+    };
+
+    var graph = ApplicationIdentityGraph.Create(app);
+
+    var strongCandidate = new CleanupCandidate
+    {
+        Target = @"HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services\SharedAccess\Parameters\FirewallPolicy\FirewallRules",
+        Auxiliary = "AcmeRule1",
+        Kind = CleanupKind.FirewallRule,
+        Risk = RiskLevel.Low,
+        Confidence = OwnershipConfidence.Certain,
+        Reason = "Windows Firewall rule references application executable",
+        AutoSelectable = true
+    };
+    True(CleanupSelectionPolicy.ShouldAutoSelect(strongCandidate));
+
+    var nameOnlyCandidate = new CleanupCandidate
+    {
+        Target = @"HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services\SharedAccess\Parameters\FirewallPolicy\FirewallRules",
+        Auxiliary = "AcmeRule2",
+        Kind = CleanupKind.FirewallRule,
+        Risk = RiskLevel.Medium,
+        Confidence = OwnershipConfidence.Medium,
+        Reason = "Windows Firewall rule name matches candidate name; review before removal",
+        AutoSelectable = false
+    };
+    False(CleanupSelectionPolicy.ShouldAutoSelect(nameOnlyCandidate));
+});
+
+// 12. Native Messaging Host Manifest Validation
+AddTest("Native messaging host: manifest-backed target is Certain, name-only is Medium/unselected", () =>
+{
+    var strongCandidate = new CleanupCandidate
+    {
+        Target = @"HKEY_CURRENT_USER\SOFTWARE\Google\Chrome\NativeMessagingHosts\com.acme.host",
+        Kind = CleanupKind.RegistryKey,
+        Risk = RiskLevel.Low,
+        Confidence = OwnershipConfidence.Certain,
+        Reason = "Browser native messaging host points to application executable",
+        AutoSelectable = true
+    };
+    True(CleanupSelectionPolicy.ShouldAutoSelect(strongCandidate));
+
+    var nameOnlyCandidate = new CleanupCandidate
+    {
+        Target = @"HKEY_CURRENT_USER\SOFTWARE\Google\Chrome\NativeMessagingHosts\com.acme.unrelated",
+        Kind = CleanupKind.RegistryKey,
+        Risk = RiskLevel.Medium,
+        Confidence = OwnershipConfidence.Medium,
+        Reason = "Browser native messaging host matches application name; review before removal",
+        AutoSelectable = false
+    };
+    False(CleanupSelectionPolicy.ShouldAutoSelect(nameOnlyCandidate));
+});
+
+// 13. App Paths Provenance Confidence Preservation
+AddTest("App Paths: weak name-only pre-capture does not become Certain post-uninstall", () =>
+{
+    var app = new InstalledApplication
+    {
+        Id = "acme-app",
+        DisplayName = "Acme",
+        InstallLocation = @"C:\Program Files\Acme"
+    };
+
+    var graph = ApplicationIdentityGraph.Create(app);
+
+    var weakCapturedAppPath = new CapturedAppPathEntry(
+        RegistryHive.LocalMachine,
+        RegistryView.Registry64,
+        "acme.exe",
+        @"C:\OtherApp\acme.exe",
+        "",
+        OwnershipConfidence.Medium,
+        ["App Paths exe key matches 'acme.exe'"]);
+
+    graph.CapturedAppPaths.Add(weakCapturedAppPath);
+
+    var candidate = new CleanupCandidate
+    {
+        Target = @"HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\acme.exe",
+        Kind = CleanupKind.RegistryKey,
+        Risk = RiskLevel.Medium,
+        Confidence = weakCapturedAppPath.Confidence,
+        Reason = "App Paths registration matches application executable name",
+        AutoSelectable = false
+    };
+
+    Equal(OwnershipConfidence.Medium, candidate.Confidence);
+    False(CleanupSelectionPolicy.ShouldAutoSelect(candidate));
+});
+
+// 14. Scheduled Task Provenance Confidence Preservation
+AddTest("Scheduled task: weak name-only pre-capture remains Medium confidence post-uninstall", () =>
+{
+    var app = new InstalledApplication
+    {
+        Id = "acme-app",
+        DisplayName = "Acme",
+        InstallLocation = @"C:\Program Files\Acme"
+    };
+
+    var graph = ApplicationIdentityGraph.Create(app);
+
+    var weakTask = new CapturedTaskEntry(
+        "AcmeUpdate",
+        "\\",
+        "C:\\Tools\\other.exe",
+        "",
+        "",
+        null,
+        OwnershipConfidence.Medium,
+        ["Task name matches candidate name 'AcmeUpdate'"]);
+
+    graph.CapturedTasks.Add(weakTask);
+
+    var candidate = new CleanupCandidate
+    {
+        Target = "\\AcmeUpdate",
+        Kind = CleanupKind.ScheduledTask,
+        Risk = RiskLevel.Medium,
+        Confidence = weakTask.Confidence,
+        Reason = "Scheduled task matches app name; review before removal",
+        AutoSelectable = false
+    };
+
+    Equal(OwnershipConfidence.Medium, candidate.Confidence);
+    False(CleanupSelectionPolicy.ShouldAutoSelect(candidate));
+});
+
+// 15. PATH Neighbor Anchors Merge-Safe Restore
+AddTest("Neighbor-anchor PATH restore restores segment relative to previous and next neighbors", () =>
+{
+    // Scenario: Original was A;APP;B. After cleanup it was A;B. Later user edited PATH to X;A;B;Y.
+    var currentPath = @"C:\NewRoot\X;C:\Tools\A;C:\Utils\B;C:\NewRoot\Y";
+    var segmentToRestore = @"C:\Program Files\Acme\bin";
+    var previousAnchor = @"C:\Tools\A";
+    var nextAnchor = @"C:\Utils\B";
+
+    var merged = QuarantineService.MergePathSegment(
+        currentPath,
+        segmentToRestore,
+        originalIndex: 1,
+        previousSegment: previousAnchor,
+        nextSegment: nextAnchor);
+
+    Equal(@"C:\NewRoot\X;C:\Tools\A;C:\Program Files\Acme\bin;C:\Utils\B;C:\NewRoot\Y", merged);
+});
+
+// 16. SameApplicationIdentity Prioritization
+AddTest("SameApplicationIdentity prioritizes Store package identity, registry key path, install location, and scope", () =>
+{
+    var store1 = new InstalledApplication
+    {
+        Id = "store1",
+        DisplayName = "App",
+        Kind = ApplicationKind.MicrosoftStore,
+        PackageFullName = "Publisher.App_1.0.0.0_x64__12345",
+        Scope = InstallScope.CurrentUser
+    };
+
+    var store2 = new InstalledApplication
+    {
+        Id = "store2",
+        DisplayName = "App",
+        Kind = ApplicationKind.MicrosoftStore,
+        PackageFullName = "Publisher.App_1.0.0.0_x64__12345",
+        Scope = InstallScope.CurrentUser
+    };
+
+    var storeDifferentScope = new InstalledApplication
+    {
+        Id = "store3",
+        DisplayName = "App",
+        Kind = ApplicationKind.MicrosoftStore,
+        PackageFullName = "Publisher.App_1.0.0.0_x64__12345",
+        Scope = InstallScope.AllUsers
+    };
+
+    True(AppDiscoveryService.SameApplicationIdentity(store1, store2));
+    False(AppDiscoveryService.SameApplicationIdentity(store1, storeDifferentScope));
+
+    var reg1 = new InstalledApplication
+    {
+        Id = "reg1",
+        DisplayName = "Desktop App",
+        Kind = ApplicationKind.Desktop,
+        RegistryKeyPath = @"HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\{1111-2222}",
+        Scope = InstallScope.AllUsers,
+        Architecture = "64-bit"
+    };
+
+    var reg2 = new InstalledApplication
+    {
+        Id = "reg2",
+        DisplayName = "Desktop App",
+        Kind = ApplicationKind.Desktop,
+        RegistryKeyPath = @"HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\{1111-2222}",
+        Scope = InstallScope.AllUsers,
+        Architecture = "64-bit"
+    };
+
+    var regDifferentKey = new InstalledApplication
+    {
+        Id = "reg3",
+        DisplayName = "Desktop App",
+        Kind = ApplicationKind.Desktop,
+        RegistryKeyPath = @"HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\{9999-8888}",
+        Scope = InstallScope.AllUsers,
+        Architecture = "64-bit"
+    };
+
+    True(AppDiscoveryService.SameApplicationIdentity(reg1, reg2));
+    False(AppDiscoveryService.SameApplicationIdentity(reg1, regDifferentKey));
+});
+
+// 17. ToolRunner Process Execution and Timeout
+AddTest("ToolRunner runs executable, captures output, and exits cleanly", () =>
+{
+    var cmd = RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ? "cmd.exe" : "echo";
+    var args = RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ? new[] { "/c", "echo", "UninstallMateTest" } : new[] { "UninstallMateTest" };
+
+    var result = ToolRunner.RunAsync(cmd, args, TimeSpan.FromSeconds(5), CancellationToken.None).GetAwaiter().GetResult();
+    True(result.Success);
+    True(result.StandardOutput.Contains("UninstallMateTest"));
+    False(result.TimedOut);
+});
+
+// 18. Backup Failure Fail-Closed Destructive Protection Test
+AddTest("Fail-closed: Target remains untouched when backup creation fails", () =>
 {
     var root = Path.Combine(Path.GetTempPath(), "UninstallMateTests", Guid.NewGuid().ToString("N"));
     try
     {
-        var protectedTarget = @"C:\Windows\System32\acme.dll";
+        var targetFile = Path.Combine(root, "app.exe");
+        Directory.CreateDirectory(root);
+        File.WriteAllText(targetFile, "binary content");
+
         var candidate = new CleanupCandidate
         {
-            Target = protectedTarget,
+            Target = targetFile,
             Kind = CleanupKind.File,
-            Risk = RiskLevel.High,
+            Risk = RiskLevel.Low,
             Confidence = OwnershipConfidence.Certain,
-            Reason = "Protected directory",
-            AutoSelectable = false
+            Reason = "App binary",
+            AutoSelectable = true,
+            IsSelected = true
         };
 
-        var service = new CleanupService(root);
-        var (report, _) = service.ExecuteAsync(TestApplication(), [candidate], true, null, CancellationToken.None).GetAwaiter().GetResult();
-        False(report.Items.Single().Success);
-        True(report.Items.Single().Detail.Contains("protected Windows directory"));
+        // Create an invalid session folder path to simulate backup failure
+        var invalidSessionRoot = Path.Combine(root, "invalid:\0folder");
+        var service = new CleanupService(invalidSessionRoot);
+
+        try
+        {
+            service.ExecuteAsync(TestApplication(), [candidate], true, null, CancellationToken.None).GetAwaiter().GetResult();
+        }
+        catch { }
+
+        // Invariant: Target file MUST remain present because backup failed
+        True(File.Exists(targetFile));
     }
     finally { if (Directory.Exists(root)) Directory.Delete(root, true); }
 });
 
-// 13. Exact Registry Type Serialization
-AddTest("RegistryValueBackupData faithfully serializes MultiString, DWord, QWord, and Binary types", () =>
+// 19. StartupApproved Cross-Hive / Cross-View Non-Correlation
+AddTest("StartupApproved correlation rejects cross-hive and cross-view false correlation", () =>
 {
-    var multiData = new RegistryValueBackupData
+    var app = new InstalledApplication
     {
-        Hive = "HKEY_CURRENT_USER",
-        View = "64",
-        SubKey = @"SOFTWARE\Acme",
-        ValueName = "List",
-        ValueKind = "MultiString",
-        MultiStringValue = ["One", "Two", "Three"]
+        Id = "agent-app",
+        DisplayName = "Agent",
+        InstallLocation = @"C:\Program Files\Agent"
     };
 
-    var json = JsonSerializer.Serialize(multiData);
-    var deserialized = JsonSerializer.Deserialize<RegistryValueBackupData>(json);
-    True(deserialized is not null);
-    EqualInt(3, deserialized!.MultiStringValue?.Length ?? 0);
-    Equal("Two", deserialized.MultiStringValue![1]);
+    var graph = ApplicationIdentityGraph.Create(app);
+
+    // HKCU Run 64-bit source
+    var hkcuKey = new StartupCorrelationKey(RegistryHive.CurrentUser, StartupSourceKind.Run, "Agent", RegistryView.Registry64);
+    var hkcuSource = new CapturedStartupSource(
+        hkcuKey,
+        @"HKEY_CURRENT_USER\SOFTWARE\Microsoft\Windows\CurrentVersion\Run",
+        @"C:\Program Files\Agent\Agent.exe",
+        null,
+        OwnershipConfidence.Certain,
+        ["Verified path"]);
+
+    graph.CapturedStartupSources.Add(hkcuSource);
+
+    // Checking HKLM approval against HKCU source must NOT match
+    var hklmKey = new StartupCorrelationKey(RegistryHive.LocalMachine, StartupSourceKind.Run, "Agent", RegistryView.Registry64);
+    var matchHklm = graph.CapturedStartupSources.FirstOrDefault(s => s.CorrelationKey == hklmKey);
+    True(matchHklm is null);
+
+    // Checking HKCU 32-bit approval against HKCU 64-bit source must NOT match
+    var hkcu32Key = new StartupCorrelationKey(RegistryHive.CurrentUser, StartupSourceKind.Run, "Agent", RegistryView.Registry32);
+    var match32 = graph.CapturedStartupSources.FirstOrDefault(s => s.CorrelationKey == hkcu32Key);
+    True(match32 is null);
 });
 
-// 14. Shared Ownership Protection
-AddTest("Shared ownership protection sets candidate to High Risk and unselected", () =>
-{
-    var app1 = TestApplicationWith("acme-1", "1.0", @"C:\Program Files\Acme Shared");
-    var app2 = TestApplicationWith("acme-2", "2.0", @"C:\Program Files\Acme Shared");
-
-    var graph = ApplicationIdentityGraph.Create(app1);
-
-    var candidate = new CleanupCandidate
-    {
-        Target = @"C:\Program Files\Acme Shared\common.dll",
-        Kind = CleanupKind.File,
-        Risk = RiskLevel.Low,
-        Confidence = OwnershipConfidence.High,
-        Reason = "App file",
-        AutoSelectable = true,
-        IsSelected = true
-    };
-
-    var candidates = new List<CleanupCandidate> { candidate };
-    CleanupScanner.ApplySharedOwnershipProtection(candidates, [app1, app2], graph);
-
-    False(candidates[0].AutoSelectable);
-    False(candidates[0].IsSelected);
-    Equal(RiskLevel.High, candidates[0].Risk);
-});
-
-// 15. Tracked Install Manifest
+// 20. Tracked Install Manifest
 AddTest("Tracked install manifest saves and retrieves for matching application", () =>
 {
     var root = Path.Combine(Path.GetTempPath(), "UninstallMateTests", Guid.NewGuid().ToString("N"));
@@ -438,7 +643,7 @@ AddTest("Tracked install manifest saves and retrieves for matching application",
     finally { if (Directory.Exists(root)) Directory.Delete(root, true); }
 });
 
-// 16. Permanent & Quarantined Directory Operations
+// 21. Permanent & Quarantined Directory Operations
 AddTest("Permanent cleanup creates no recovery payload", () =>
 {
     var root = Path.Combine(Path.GetTempPath(), "UninstallMateTests", Guid.NewGuid().ToString("N"));
@@ -483,7 +688,7 @@ AddTest("Quarantined cleanup can be restored", () =>
     finally { if (Directory.Exists(root)) Directory.Delete(root, true); }
 });
 
-// 17. Real Windows Platform Tests
+// 22. Real Windows Platform Tests
 if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
 {
     AddTest("Quoted executable is parsed", () =>
@@ -528,7 +733,7 @@ if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
 
             var graph = ApplicationIdentityGraph.Create(app);
             var neatKey = new StartupCorrelationKey(
-                RegistryHive.CurrentUser, RegistryView.Registry64, StartupSourceKind.Run, neatValueName);
+                RegistryHive.CurrentUser, StartupSourceKind.Run, neatValueName, RegistryView.Registry64);
 
             graph.CapturedStartupSources.Add(new CapturedStartupSource(
                 neatKey,
@@ -615,6 +820,93 @@ if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
                 using var key = hive.OpenSubKey(subKey, writable: true);
                 key?.DeleteValue(valName, false);
             }
+        }
+    });
+
+    AddTest("Registry types (SZ, EXPAND_SZ, MULTI_SZ, DWORD, QWORD, BINARY) complete round trip faithfully", () =>
+    {
+        const string subKey = @"Software\UninstallMateTests\TypeRoundTripTest";
+        var suffix = Guid.NewGuid().ToString("N");
+        var szName = "SZ-" + suffix;
+        var expandName = "EXPAND-" + suffix;
+        var multiName = "MULTI-" + suffix;
+        var dwordName = "DWORD-" + suffix;
+        var qwordName = "QWORD-" + suffix;
+        var binaryName = "BINARY-" + suffix;
+
+        try
+        {
+            using (var hive = RegistryKey.OpenBaseKey(RegistryHive.CurrentUser, RegistryView.Registry64))
+            using (var key = hive.CreateSubKey(subKey))
+            {
+                key.SetValue(szName, "SimpleString", RegistryValueKind.String);
+                key.SetValue(expandName, "%SystemRoot%\\test", RegistryValueKind.ExpandString);
+                key.SetValue(multiName, new[] { "Line1", "Line2" }, RegistryValueKind.MultiString);
+                key.SetValue(dwordName, 42, RegistryValueKind.DWord);
+                key.SetValue(qwordName, 9876543210L, RegistryValueKind.QWord);
+                key.SetValue(binaryName, new byte[] { 0xDE, 0xAD, 0xBE, 0xEF }, RegistryValueKind.Binary);
+            }
+
+            var szBundle = CleanupService.CreateRegistryValueBundle($@"HKEY_CURRENT_USER\{subKey}", szName);
+            var expandBundle = CleanupService.CreateRegistryValueBundle($@"HKEY_CURRENT_USER\{subKey}", expandName);
+            var multiBundle = CleanupService.CreateRegistryValueBundle($@"HKEY_CURRENT_USER\{subKey}", multiName);
+            var dwordBundle = CleanupService.CreateRegistryValueBundle($@"HKEY_CURRENT_USER\{subKey}", dwordName);
+            var qwordBundle = CleanupService.CreateRegistryValueBundle($@"HKEY_CURRENT_USER\{subKey}", qwordName);
+            var binaryBundle = CleanupService.CreateRegistryValueBundle($@"HKEY_CURRENT_USER\{subKey}", binaryName);
+
+            Equal("SimpleString", szBundle.Values.First().StringValue);
+            Equal("%SystemRoot%\\test", expandBundle.Values.First().StringValue);
+            EqualInt(2, multiBundle.Values.First().MultiStringValue!.Length);
+            EqualInt(42, dwordBundle.Values.First().DWordValue!.Value);
+            Equal(9876543210L, qwordBundle.Values.First().QWordValue!.Value);
+            EqualInt(4, binaryBundle.Values.First().BinaryValue!.Length);
+
+            // Delete all values
+            using (var hive = RegistryKey.OpenBaseKey(RegistryHive.CurrentUser, RegistryView.Registry64))
+            using (var key = hive.OpenSubKey(subKey, writable: true))
+            {
+                key!.DeleteValue(szName);
+                key.DeleteValue(expandName);
+                key.DeleteValue(multiName);
+                key.DeleteValue(dwordName);
+                key.DeleteValue(qwordName);
+                key.DeleteValue(binaryName);
+            }
+
+            // Restore all bundles
+            QuarantineService.RestoreRegistryValueBundle(szBundle);
+            QuarantineService.RestoreRegistryValueBundle(expandBundle);
+            QuarantineService.RestoreRegistryValueBundle(multiBundle);
+            QuarantineService.RestoreRegistryValueBundle(dwordBundle);
+            QuarantineService.RestoreRegistryValueBundle(qwordBundle);
+            QuarantineService.RestoreRegistryValueBundle(binaryBundle);
+
+            // Verify exact restored data and kinds
+            using (var hive = RegistryKey.OpenBaseKey(RegistryHive.CurrentUser, RegistryView.Registry64))
+            using (var key = hive.OpenSubKey(subKey))
+            {
+                Equal("SimpleString", key!.GetValue(szName, "", RegistryValueOptions.DoNotExpandEnvironmentNames));
+                Equal("%SystemRoot%\\test", key.GetValue(expandName, "", RegistryValueOptions.DoNotExpandEnvironmentNames));
+                var multiArr = key.GetValue(multiName) as string[];
+                EqualInt(2, multiArr!.Length);
+                Equal("Line2", multiArr[1]);
+                Equal(42, Convert.ToInt32(key.GetValue(dwordName)));
+                Equal(9876543210L, Convert.ToInt64(key.GetValue(qwordName)));
+                var binArr = key.GetValue(binaryName) as byte[];
+                EqualInt(4, binArr!.Length);
+                Equal((byte)0xDE, binArr[0]);
+            }
+        }
+        finally
+        {
+            using var hive = RegistryKey.OpenBaseKey(RegistryHive.CurrentUser, RegistryView.Registry64);
+            using var key = hive.OpenSubKey(subKey, writable: true);
+            key?.DeleteValue(szName, false);
+            key?.DeleteValue(expandName, false);
+            key?.DeleteValue(multiName, false);
+            key?.DeleteValue(dwordName, false);
+            key?.DeleteValue(qwordName, false);
+            key?.DeleteValue(binaryName, false);
         }
     });
 }

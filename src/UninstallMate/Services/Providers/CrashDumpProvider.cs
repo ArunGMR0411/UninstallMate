@@ -15,6 +15,7 @@ public sealed class CrashDumpProvider : ICleanupArtifactProvider
         var sw = Stopwatch.StartNew();
         var candidates = new List<CleanupCandidate>();
         var diagnostics = new List<ScanDiagnostic>();
+        var statusAcc = new ScanStatusAccumulator();
 
         var crashRoot = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "CrashDumps");
         if (!Directory.Exists(crashRoot))
@@ -38,7 +39,7 @@ public sealed class CrashDumpProvider : ICleanupArtifactProvider
                 {
                     var size = 0L;
                     try { size = new FileInfo(file).Length; } catch { }
-                    candidates.Add(new CleanupCandidate
+                    var candidate = new CleanupCandidate
                     {
                         Target = file,
                         Kind = CleanupKind.File,
@@ -49,20 +50,28 @@ public sealed class CrashDumpProvider : ICleanupArtifactProvider
                         Scope = CleanupScope.User,
                         SourceProvider = Name,
                         EvidenceList = [$"Crash dump: {file}"],
-                        IsSelected = true
-                    });
+                        AutoSelectable = true
+                    };
+                    candidate.IsSelected = CleanupSelectionPolicy.ShouldAutoSelect(candidate);
+                    candidates.Add(candidate);
                 }
             }
+        }
+        catch (UnauthorizedAccessException ex)
+        {
+            diagnostics.Add(new ScanDiagnostic(Name, $"Access denied scanning crash dumps: {ex.Message}", IsWarning: true, TargetPath: crashRoot));
+            statusAcc.MarkAccessDenied();
         }
         catch (Exception ex)
         {
             diagnostics.Add(new ScanDiagnostic(Name, $"Failed scanning crash dumps: {ex.Message}", IsWarning: true, TargetPath: crashRoot));
+            statusAcc.MarkWarning();
         }
 
         return Task.FromResult(new ProviderScanResult
         {
             ProviderName = Name,
-            Status = ScanStatus.Complete,
+            Status = statusAcc.Status,
             Candidates = candidates,
             Diagnostics = diagnostics,
             Elapsed = sw.Elapsed

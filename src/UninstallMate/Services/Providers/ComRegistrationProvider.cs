@@ -17,6 +17,7 @@ public sealed class ComRegistrationProvider : ICleanupArtifactProvider
         var sw = Stopwatch.StartNew();
         var candidates = new List<CleanupCandidate>();
         var diagnostics = new List<ScanDiagnostic>();
+        var statusAcc = new ScanStatusAccumulator();
 
         if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
         {
@@ -27,19 +28,20 @@ public sealed class ComRegistrationProvider : ICleanupArtifactProvider
         {
             try
             {
-                ScanClsids(identity, context, candidates, diagnostics, token);
-                ScanTypeLibs(identity, context, candidates, diagnostics, token);
+                ScanClsids(identity, context, candidates, diagnostics, statusAcc, token);
+                ScanTypeLibs(identity, context, candidates, diagnostics, statusAcc, token);
             }
             catch (Exception ex)
             {
                 diagnostics.Add(new ScanDiagnostic(Name, $"Error during COM scan: {ex.Message}", IsError: true, ExceptionDetail: ex.ToString()));
+                statusAcc.MarkFailed();
             }
         }, token);
 
         return new ProviderScanResult
         {
             ProviderName = Name,
-            Status = diagnostics.Any(d => d.IsError) ? ScanStatus.CompleteWithWarnings : ScanStatus.Complete,
+            Status = statusAcc.Status,
             Candidates = candidates,
             Diagnostics = diagnostics,
             Elapsed = sw.Elapsed
@@ -51,6 +53,7 @@ public sealed class ComRegistrationProvider : ICleanupArtifactProvider
         CleanupScanContext context,
         List<CleanupCandidate> candidates,
         List<ScanDiagnostic> diagnostics,
+        ScanStatusAccumulator statusAcc,
         CancellationToken token)
     {
         const string rootPath = @"SOFTWARE\Classes\CLSID";
@@ -84,7 +87,7 @@ public sealed class ComRegistrationProvider : ICleanupArtifactProvider
                         if (!identity.ReferencesEvidence(combined)) continue;
 
                         var target = $@"{hiveText}\{rootPath}\{clsid}";
-                        candidates.Add(new CleanupCandidate
+                        var candidate = new CleanupCandidate
                         {
                             Target = target,
                             Kind = CleanupKind.RegistryKey,
@@ -95,17 +98,21 @@ public sealed class ComRegistrationProvider : ICleanupArtifactProvider
                             Reason = $"COM CLSID registration loads binary from app installation ({viewName}-bit view)",
                             SourceProvider = Name,
                             EvidenceList = [$"CLSID: {clsid}", $"Target binary: {(inproc.Length > 0 ? inproc : local)}"],
-                            IsSelected = false
-                        });
+                            AutoSelectable = false // COM registrations default unselected for safety
+                        };
+                        candidate.IsSelected = CleanupSelectionPolicy.ShouldAutoSelect(candidate);
+                        candidates.Add(candidate);
                     }
                 }
                 catch (UnauthorizedAccessException ex)
                 {
                     diagnostics.Add(new ScanDiagnostic(Name, $"Access denied for COM CLSIDs in {hiveText}", IsWarning: true, TargetPath: $@"{hiveText}\{rootPath}", ExceptionDetail: ex.Message));
+                    statusAcc.MarkAccessDenied();
                 }
                 catch (Exception ex)
                 {
                     diagnostics.Add(new ScanDiagnostic(Name, $"Failed scanning COM CLSIDs in {hiveText} ({viewName}-bit): {ex.Message}", IsWarning: true, TargetPath: $@"{hiveText}\{rootPath}", ExceptionDetail: ex.Message));
+                    statusAcc.MarkWarning();
                 }
             }
         }
@@ -116,6 +123,7 @@ public sealed class ComRegistrationProvider : ICleanupArtifactProvider
         CleanupScanContext context,
         List<CleanupCandidate> candidates,
         List<ScanDiagnostic> diagnostics,
+        ScanStatusAccumulator statusAcc,
         CancellationToken token)
     {
         const string rootPath = @"SOFTWARE\Classes\TypeLib";
@@ -157,7 +165,7 @@ public sealed class ComRegistrationProvider : ICleanupArtifactProvider
                                         var target = $@"{hiveText}\{rootPath}\{libId}";
                                         if (candidates.All(c => !c.Target.Equals(target, StringComparison.OrdinalIgnoreCase)))
                                         {
-                                            candidates.Add(new CleanupCandidate
+                                            var candidate = new CleanupCandidate
                                             {
                                                 Target = target,
                                                 Kind = CleanupKind.RegistryKey,
@@ -168,8 +176,10 @@ public sealed class ComRegistrationProvider : ICleanupArtifactProvider
                                                 Reason = $"TypeLib registration points into app installation ({viewName}-bit view)",
                                                 SourceProvider = Name,
                                                 EvidenceList = [$"TypeLib: {libId} version {ver}", $"Path: {path}"],
-                                                IsSelected = false
-                                            });
+                                                AutoSelectable = false
+                                            };
+                                            candidate.IsSelected = CleanupSelectionPolicy.ShouldAutoSelect(candidate);
+                                            candidates.Add(candidate);
                                         }
                                     }
                                 }
@@ -177,7 +187,16 @@ public sealed class ComRegistrationProvider : ICleanupArtifactProvider
                         }
                     }
                 }
-                catch { }
+                catch (UnauthorizedAccessException ex)
+                {
+                    diagnostics.Add(new ScanDiagnostic(Name, $"Access denied for COM TypeLibs in {hiveText}", IsWarning: true, TargetPath: $@"{hiveText}\{rootPath}", ExceptionDetail: ex.Message));
+                    statusAcc.MarkAccessDenied();
+                }
+                catch (Exception ex)
+                {
+                    diagnostics.Add(new ScanDiagnostic(Name, $"Failed scanning TypeLibs in {hiveText}: {ex.Message}", IsWarning: true, TargetPath: $@"{hiveText}\{rootPath}", ExceptionDetail: ex.Message));
+                    statusAcc.MarkWarning();
+                }
             }
         }
     }

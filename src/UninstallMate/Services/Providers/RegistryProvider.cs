@@ -17,6 +17,7 @@ public sealed class RegistryProvider : ICleanupArtifactProvider
         var sw = Stopwatch.StartNew();
         var candidates = new List<CleanupCandidate>();
         var diagnostics = new List<ScanDiagnostic>();
+        var statusAcc = new ScanStatusAccumulator();
 
         if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
         {
@@ -27,19 +28,20 @@ public sealed class RegistryProvider : ICleanupArtifactProvider
         {
             try
             {
-                ScanUninstallEntries(identity, context, candidates, diagnostics, token);
-                ScanSoftwareKeys(identity, context, candidates, diagnostics, token);
+                ScanUninstallEntries(identity, context, candidates, diagnostics, statusAcc, token);
+                ScanSoftwareKeys(identity, context, candidates, diagnostics, statusAcc, token);
             }
             catch (Exception ex)
             {
                 diagnostics.Add(new ScanDiagnostic(Name, $"Error during registry scan: {ex.Message}", IsError: true, ExceptionDetail: ex.ToString()));
+                statusAcc.MarkFailed();
             }
         }, token);
 
         return new ProviderScanResult
         {
             ProviderName = Name,
-            Status = diagnostics.Any(d => d.IsError) ? ScanStatus.CompleteWithWarnings : ScanStatus.Complete,
+            Status = statusAcc.Status,
             Candidates = candidates,
             Diagnostics = diagnostics,
             Elapsed = sw.Elapsed
@@ -51,6 +53,7 @@ public sealed class RegistryProvider : ICleanupArtifactProvider
         CleanupScanContext context,
         List<CleanupCandidate> candidates,
         List<ScanDiagnostic> diagnostics,
+        ScanStatusAccumulator statusAcc,
         CancellationToken token)
     {
         if (identity.Kind == ApplicationKind.MicrosoftStore) return;
@@ -60,7 +63,7 @@ public sealed class RegistryProvider : ICleanupArtifactProvider
 
         if (!string.IsNullOrWhiteSpace(identity.RegistryKeyPath) && RegistryPathExists(identity.RegistryKeyPath, appRegistryView))
         {
-            candidates.Add(new CleanupCandidate
+            var candidate = new CleanupCandidate
             {
                 Target = identity.RegistryKeyPath,
                 Kind = CleanupKind.RegistryKey,
@@ -71,8 +74,10 @@ public sealed class RegistryProvider : ICleanupArtifactProvider
                 Scope = identity.RegistryKeyPath.StartsWith("HKEY_CURRENT_USER", StringComparison.OrdinalIgnoreCase) ? CleanupScope.User : CleanupScope.System,
                 SourceProvider = Name,
                 EvidenceList = [$"Registered key: {identity.RegistryKeyPath}"],
-                IsSelected = true
-            });
+                AutoSelectable = true
+            };
+            candidate.IsSelected = CleanupSelectionPolicy.ShouldAutoSelect(candidate);
+            candidates.Add(candidate);
         }
 
         // Equivalent registrations across other views/hives
@@ -96,7 +101,7 @@ public sealed class RegistryProvider : ICleanupArtifactProvider
                         if (candidates.Any(c => c.Target.Equals(path, StringComparison.OrdinalIgnoreCase) && c.RegistryViewName == view))
                             continue;
 
-                        candidates.Add(new CleanupCandidate
+                        var candidate = new CleanupCandidate
                         {
                             Target = path,
                             Kind = CleanupKind.RegistryKey,
@@ -109,13 +114,21 @@ public sealed class RegistryProvider : ICleanupArtifactProvider
                             Scope = hiveName == RegistryHive.CurrentUser ? CleanupScope.User : CleanupScope.System,
                             SourceProvider = Name,
                             EvidenceList = [$"Uninstall registration matching '{identity.DisplayName}'"],
-                            IsSelected = true
-                        });
+                            AutoSelectable = true
+                        };
+                        candidate.IsSelected = CleanupSelectionPolicy.ShouldAutoSelect(candidate);
+                        candidates.Add(candidate);
                     }
+                }
+                catch (UnauthorizedAccessException ex)
+                {
+                    diagnostics.Add(new ScanDiagnostic(Name, $"Access denied scanning uninstall keys in {hiveText} ({view}-bit): {ex.Message}", IsWarning: true));
+                    statusAcc.MarkAccessDenied();
                 }
                 catch (Exception ex)
                 {
                     diagnostics.Add(new ScanDiagnostic(Name, $"Failed scanning uninstall keys in {hiveText} ({view}-bit): {ex.Message}", IsWarning: true));
+                    statusAcc.MarkWarning();
                 }
             }
         }
@@ -126,6 +139,7 @@ public sealed class RegistryProvider : ICleanupArtifactProvider
         CleanupScanContext context,
         List<CleanupCandidate> candidates,
         List<ScanDiagnostic> diagnostics,
+        ScanStatusAccumulator statusAcc,
         CancellationToken token)
     {
         var names = identity.CandidateNames.ToArray();
@@ -135,7 +149,7 @@ public sealed class RegistryProvider : ICleanupArtifactProvider
             foreach (var name in names)
             {
                 token.ThrowIfCancellationRequested();
-                AddRegistryIfPresent($@"{hive}\SOFTWARE\{name}", "Exact app-named software key", candidates, diagnostics, scope, name);
+                AddRegistryIfPresent($@"{hive}\SOFTWARE\{name}", "Exact app-named software key", candidates, diagnostics, statusAcc, scope, name);
             }
 
             var publisher = SafeSegment(identity.Publisher);
@@ -144,7 +158,7 @@ public sealed class RegistryProvider : ICleanupArtifactProvider
                 foreach (var name in names)
                 {
                     token.ThrowIfCancellationRequested();
-                    AddRegistryIfPresent($@"{hive}\SOFTWARE\{publisher}\{name}", "App key below its publisher key", candidates, diagnostics, scope, $"{publisher}\\{name}");
+                    AddRegistryIfPresent($@"{hive}\SOFTWARE\{publisher}\{name}", "App key below its publisher key", candidates, diagnostics, statusAcc, scope, $"{publisher}\\{name}");
                 }
             }
         }
@@ -155,6 +169,7 @@ public sealed class RegistryProvider : ICleanupArtifactProvider
         string reason,
         List<CleanupCandidate> candidates,
         List<ScanDiagnostic> diagnostics,
+        ScanStatusAccumulator statusAcc,
         CleanupScope scope,
         string matchName)
     {
@@ -163,7 +178,7 @@ public sealed class RegistryProvider : ICleanupArtifactProvider
             try
             {
                 if (!RegistryPathExists(path, view)) continue;
-                candidates.Add(new CleanupCandidate
+                var candidate = new CleanupCandidate
                 {
                     Target = path,
                     Kind = CleanupKind.RegistryKey,
@@ -174,12 +189,20 @@ public sealed class RegistryProvider : ICleanupArtifactProvider
                     Scope = scope,
                     SourceProvider = Name,
                     EvidenceList = [$"Registry key matched '{matchName}' in {view}-bit view"],
-                    IsSelected = false // Software keys under publisher might be medium risk
-                });
+                    AutoSelectable = false // Software keys under publisher/shared namespace require review
+                };
+                candidate.IsSelected = CleanupSelectionPolicy.ShouldAutoSelect(candidate);
+                candidates.Add(candidate);
+            }
+            catch (UnauthorizedAccessException ex)
+            {
+                diagnostics.Add(new ScanDiagnostic(Name, $"Access denied checking registry path '{path}' ({view}-bit): {ex.Message}", IsWarning: true, TargetPath: path));
+                statusAcc.MarkAccessDenied();
             }
             catch (Exception ex)
             {
                 diagnostics.Add(new ScanDiagnostic(Name, $"Failed checking registry path '{path}' ({view}-bit): {ex.Message}", IsWarning: true, TargetPath: path));
+                statusAcc.MarkWarning();
             }
         }
     }

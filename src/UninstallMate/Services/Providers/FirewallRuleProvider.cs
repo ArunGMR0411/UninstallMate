@@ -17,6 +17,7 @@ public sealed class FirewallRuleProvider : ICleanupArtifactProvider
         var sw = Stopwatch.StartNew();
         var candidates = new List<CleanupCandidate>();
         var diagnostics = new List<ScanDiagnostic>();
+        var statusAcc = new ScanStatusAccumulator();
 
         if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
         {
@@ -27,18 +28,19 @@ public sealed class FirewallRuleProvider : ICleanupArtifactProvider
         {
             try
             {
-                ScanRegistryFirewallRules(identity, context, candidates, diagnostics, token);
+                ScanRegistryFirewallRules(identity, context, candidates, diagnostics, statusAcc, token);
             }
             catch (Exception ex)
             {
                 diagnostics.Add(new ScanDiagnostic(Name, $"Error during firewall rule scan: {ex.Message}", IsError: true, ExceptionDetail: ex.ToString()));
+                statusAcc.MarkFailed();
             }
         }, token);
 
         return new ProviderScanResult
         {
             ProviderName = Name,
-            Status = diagnostics.Any(d => d.IsError) ? ScanStatus.CompleteWithWarnings : ScanStatus.Complete,
+            Status = statusAcc.Status,
             Candidates = candidates,
             Diagnostics = diagnostics,
             Elapsed = sw.Elapsed
@@ -50,6 +52,7 @@ public sealed class FirewallRuleProvider : ICleanupArtifactProvider
         CleanupScanContext context,
         List<CleanupCandidate> candidates,
         List<ScanDiagnostic> diagnostics,
+        ScanStatusAccumulator statusAcc,
         CancellationToken token)
     {
         const string firewallRulesPath = @"SYSTEM\CurrentControlSet\Services\SharedAccess\Parameters\FirewallPolicy\FirewallRules";
@@ -71,42 +74,52 @@ public sealed class FirewallRuleProvider : ICleanupArtifactProvider
                 var svcMatch = ExtractRuleProperty(ruleData, "Svc");
 
                 var matchesAppPath = !string.IsNullOrEmpty(appMatch) && identity.ReferencesEvidence(appMatch);
-                var matchesAppName = !string.IsNullOrEmpty(nameMatch) && identity.CandidateNames.Any(c => c.Equals(nameMatch, StringComparison.OrdinalIgnoreCase));
                 var matchesSvc = !string.IsNullOrEmpty(svcMatch) && identity.CapturedServices.Any(s => s.ServiceName.Equals(svcMatch, StringComparison.OrdinalIgnoreCase));
+                var matchesAppName = !string.IsNullOrEmpty(nameMatch) && identity.CandidateNames.Any(c => c.Equals(nameMatch, StringComparison.OrdinalIgnoreCase));
 
                 if (!matchesAppPath && !matchesSvc && !matchesAppName) continue;
 
-                var confidence = (matchesAppPath || matchesSvc) ? OwnershipConfidence.Certain : OwnershipConfidence.High;
+                var isStrong = matchesAppPath || matchesSvc;
+                var confidence = isStrong ? OwnershipConfidence.Certain : OwnershipConfidence.Medium;
+                var risk = isStrong ? RiskLevel.Low : RiskLevel.Medium;
+                var autoSelect = isStrong;
+
                 var target = $@"HKEY_LOCAL_MACHINE\{firewallRulesPath}";
                 var reason = matchesAppPath
                     ? $"Windows Firewall rule references application executable '{appMatch}'"
-                    : $"Windows Firewall rule references application service '{svcMatch}'";
+                    : (matchesSvc
+                        ? $"Windows Firewall rule references application service '{svcMatch}'"
+                        : $"Windows Firewall rule name '{nameMatch}' matches candidate name; review before removal");
 
-                candidates.Add(new CleanupCandidate
+                var candidate = new CleanupCandidate
                 {
                     Target = target,
                     Auxiliary = ruleValueName,
                     Kind = CleanupKind.FirewallRule,
                     RegistryViewName = "64",
-                    Risk = RiskLevel.Low,
+                    Risk = risk,
                     Confidence = confidence,
                     Scope = CleanupScope.System,
                     Reason = reason,
                     SourceProvider = Name,
                     RegistryValueKindName = "String",
                     RegistryRawValueBase64 = ruleData,
-                    EvidenceList = [$"Firewall Rule: {nameMatch}", $"App: {appMatch}", $"Data: {ruleData}"],
-                    IsSelected = confidence >= OwnershipConfidence.High
-                });
+                    AutoSelectable = autoSelect,
+                    EvidenceList = [$"Firewall Rule: {nameMatch}", $"App: {appMatch}", $"Data: {ruleData}"]
+                };
+                candidate.IsSelected = CleanupSelectionPolicy.ShouldAutoSelect(candidate);
+                candidates.Add(candidate);
             }
         }
         catch (UnauthorizedAccessException ex)
         {
             diagnostics.Add(new ScanDiagnostic(Name, "Access denied reading Firewall Rules", IsWarning: true, TargetPath: firewallRulesPath, ExceptionDetail: ex.Message));
+            statusAcc.MarkAccessDenied();
         }
         catch (Exception ex)
         {
             diagnostics.Add(new ScanDiagnostic(Name, $"Failed reading Firewall Rules: {ex.Message}", IsWarning: true, TargetPath: firewallRulesPath, ExceptionDetail: ex.Message));
+            statusAcc.MarkWarning();
         }
     }
 

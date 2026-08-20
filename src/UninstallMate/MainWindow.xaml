@@ -167,8 +167,6 @@
                         ToolTip="Ask Windows to create a restore point before uninstall or cleanup" Margin="0,0,0,10" />
               <CheckBox Content="Recovery backup" IsChecked="{Binding PreserveCleanupBackups}"
                         ToolTip="Keep recoverable copies of removed files and system definitions" Margin="0,0,0,10" />
-              <CheckBox Content="Deep scan" IsChecked="{Binding IsDeepScan}"
-                        ToolTip="Perform deep heuristic inspection of related software classes and data folders" />
               <TextBlock Text="Safe recovery active by default."
                          Foreground="{DynamicResource TextFillColorTertiaryBrush}" FontSize="10"
                          TextWrapping="Wrap" Margin="2,10,0,0" />

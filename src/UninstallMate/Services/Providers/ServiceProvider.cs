@@ -17,6 +17,7 @@ public sealed class ServiceProvider : ICleanupArtifactProvider
         var sw = Stopwatch.StartNew();
         var candidates = new List<CleanupCandidate>();
         var diagnostics = new List<ScanDiagnostic>();
+        var statusAcc = new ScanStatusAccumulator();
 
         if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
         {
@@ -27,18 +28,19 @@ public sealed class ServiceProvider : ICleanupArtifactProvider
         {
             try
             {
-                ScanServices(identity, context, candidates, diagnostics, token);
+                ScanServices(identity, context, candidates, diagnostics, statusAcc, token);
             }
             catch (Exception ex)
             {
                 diagnostics.Add(new ScanDiagnostic(Name, $"Error during service scan: {ex.Message}", IsError: true, ExceptionDetail: ex.ToString()));
+                statusAcc.MarkFailed();
             }
         }, token);
 
         return new ProviderScanResult
         {
             ProviderName = Name,
-            Status = diagnostics.Any(d => d.IsError) ? ScanStatus.CompleteWithWarnings : ScanStatus.Complete,
+            Status = statusAcc.Status,
             Candidates = candidates,
             Diagnostics = diagnostics,
             Elapsed = sw.Elapsed
@@ -50,6 +52,7 @@ public sealed class ServiceProvider : ICleanupArtifactProvider
         CleanupScanContext context,
         List<CleanupCandidate> candidates,
         List<ScanDiagnostic> diagnostics,
+        ScanStatusAccumulator statusAcc,
         CancellationToken token)
     {
         const string servicesPath = @"SYSTEM\CurrentControlSet\Services";
@@ -76,28 +79,32 @@ public sealed class ServiceProvider : ICleanupArtifactProvider
                     }
 
                     var matchesEvidence = identity.ReferencesEvidence(imagePath) || identity.ReferencesEvidence(serviceDll);
-                    var matchesPre = identity.CapturedServices.Any(s => s.ServiceName.Equals(serviceName, StringComparison.OrdinalIgnoreCase));
+                    var matchingPre = identity.CapturedServices.FirstOrDefault(s => s.ServiceName.Equals(serviceName, StringComparison.OrdinalIgnoreCase));
                     var matchesName = identity.CandidateNames.Any(c => c.Equals(serviceName, StringComparison.OrdinalIgnoreCase));
 
-                    if (!matchesEvidence && !matchesPre && !matchesName) continue;
+                    if (!matchesEvidence && matchingPre is null && !matchesName) continue;
+
+                    var isPathBacked = matchesEvidence || (matchingPre is not null && matchingPre.Confidence == OwnershipConfidence.Certain);
+                    var confidence = isPathBacked ? OwnershipConfidence.Certain : OwnershipConfidence.Medium;
 
                     var type = Convert.ToInt32(service.GetValue("Type") ?? 0);
                     var isDriver = (type & 0x3) != 0;
-                    var confidence = (matchesPre || matchesEvidence) ? OwnershipConfidence.Certain : OwnershipConfidence.High;
                     var target = $@"HKEY_LOCAL_MACHINE\{servicesPath}\{serviceName}";
 
                     var reason = isDriver
                         ? "Driver service loads a binary from the app's installation"
                         : (serviceDll.Length > 0
                             ? $"svchost-hosted service loads DLL '{serviceDll}' from the app's installation"
-                            : "Windows service runs a binary from the app's installation");
+                            : (isPathBacked
+                                ? "Windows service runs a binary from the app's installation"
+                                : $"Windows service '{serviceName}' matches application name; review before removal"));
 
                     var evidence = new List<string>();
                     if (imagePath.Length > 0) evidence.Add($"ImagePath: {imagePath}");
                     if (serviceDll.Length > 0) evidence.Add($"ServiceDll: {serviceDll}");
-                    if (matchesPre) evidence.Add($"Recorded in pre-uninstall service snapshot");
+                    if (matchingPre is not null) evidence.AddRange(matchingPre.Evidence);
 
-                    candidates.Add(new CleanupCandidate
+                    var candidate = new CleanupCandidate
                     {
                         Target = target,
                         Auxiliary = serviceName,
@@ -109,22 +116,32 @@ public sealed class ServiceProvider : ICleanupArtifactProvider
                         Reason = reason,
                         SourceProvider = Name,
                         EvidenceList = evidence,
-                        IsSelected = false // Services default unselected for safety
-                    });
+                        AutoSelectable = false // Services default unselected for safety
+                    };
+                    candidate.IsSelected = CleanupSelectionPolicy.ShouldAutoSelect(candidate);
+                    candidates.Add(candidate);
+                }
+                catch (UnauthorizedAccessException ex)
+                {
+                    diagnostics.Add(new ScanDiagnostic(Name, $"Access denied inspecting service '{serviceName}': {ex.Message}", IsWarning: true, TargetPath: serviceName));
+                    statusAcc.MarkAccessDenied();
                 }
                 catch (Exception ex)
                 {
                     diagnostics.Add(new ScanDiagnostic(Name, $"Failed inspecting service '{serviceName}': {ex.Message}", IsWarning: true, TargetPath: serviceName));
+                    statusAcc.MarkWarning();
                 }
             }
         }
         catch (UnauthorizedAccessException ex)
         {
             diagnostics.Add(new ScanDiagnostic(Name, "Access denied reading Services key", IsWarning: true, TargetPath: servicesPath, ExceptionDetail: ex.Message));
+            statusAcc.MarkAccessDenied();
         }
         catch (Exception ex)
         {
             diagnostics.Add(new ScanDiagnostic(Name, $"Failed reading Services: {ex.Message}", IsError: true, TargetPath: servicesPath, ExceptionDetail: ex.Message));
+            statusAcc.MarkFailed();
         }
     }
 }

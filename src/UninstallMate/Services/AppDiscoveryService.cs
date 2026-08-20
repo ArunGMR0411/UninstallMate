@@ -51,9 +51,53 @@ public sealed partial class AppDiscoveryService
         return string.Join('|', Normalize(app.DisplayName), Normalize(app.Publisher), Normalize(app.Version));
     }
 
-    internal static bool SameApplicationIdentity(InstalledApplication left, InstalledApplication right) =>
-        left.Kind == right.Kind
-        && BasicIdentityKey(left).Equals(BasicIdentityKey(right), StringComparison.OrdinalIgnoreCase);
+    internal static bool SameApplicationIdentity(InstalledApplication left, InstalledApplication right)
+    {
+        if (left.Kind != right.Kind) return false;
+
+        // 1. Store Apps
+        if (left.Kind == ApplicationKind.MicrosoftStore)
+        {
+            if (!string.IsNullOrEmpty(left.PackageFullName) && !string.IsNullOrEmpty(right.PackageFullName))
+            {
+                return left.PackageFullName.Equals(right.PackageFullName, StringComparison.OrdinalIgnoreCase)
+                    && left.Scope == right.Scope;
+            }
+            if (!string.IsNullOrEmpty(left.PackageFamilyName) && !string.IsNullOrEmpty(right.PackageFamilyName))
+            {
+                return left.PackageFamilyName.Equals(right.PackageFamilyName, StringComparison.OrdinalIgnoreCase)
+                    && left.Scope == right.Scope;
+            }
+        }
+
+        // 2. MSI / Registry Apps
+        if (!string.IsNullOrEmpty(left.RegistryKeyPath) && !string.IsNullOrEmpty(right.RegistryKeyPath))
+        {
+            if (left.RegistryKeyPath.Equals(right.RegistryKeyPath, StringComparison.OrdinalIgnoreCase))
+            {
+                return left.Scope == right.Scope
+                    && (string.IsNullOrEmpty(left.Architecture) || string.IsNullOrEmpty(right.Architecture)
+                        || left.Architecture.Equals(right.Architecture, StringComparison.OrdinalIgnoreCase));
+            }
+            return false;
+        }
+
+        // 3. Install Location match
+        var locLeft = NormalizeLocation(left.InstallLocation);
+        var locRight = NormalizeLocation(right.InstallLocation);
+        if (!string.IsNullOrEmpty(locLeft) && !string.IsNullOrEmpty(locRight))
+        {
+            if (locLeft.Equals(locRight, StringComparison.OrdinalIgnoreCase))
+            {
+                return left.DisplayName.Equals(right.DisplayName, StringComparison.OrdinalIgnoreCase);
+            }
+            return false;
+        }
+
+        // 4. Fallback: DisplayName + Publisher + Version + Scope
+        return BasicIdentityKey(left).Equals(BasicIdentityKey(right), StringComparison.OrdinalIgnoreCase)
+            && left.Scope == right.Scope;
+    }
 
     private static string NormalizeLocation(string location)
     {

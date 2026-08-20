@@ -17,6 +17,7 @@ public sealed class ScheduledTaskProvider : ICleanupArtifactProvider
         var sw = Stopwatch.StartNew();
         var candidates = new List<CleanupCandidate>();
         var diagnostics = new List<ScanDiagnostic>();
+        var statusAcc = new ScanStatusAccumulator();
 
         if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
         {
@@ -24,76 +25,93 @@ public sealed class ScheduledTaskProvider : ICleanupArtifactProvider
         }
 
         const string script = "$ProgressPreference='SilentlyContinue'; Get-ScheduledTask -ErrorAction SilentlyContinue | ForEach-Object { $t=$_; foreach($a in $_.Actions) { [pscustomobject]@{TaskName=$t.TaskName;TaskPath=$t.TaskPath;Execute=$a.Execute;Arguments=$a.Arguments;WorkingDirectory=$a.WorkingDirectory} } } | ConvertTo-Json -Compress";
-        var start = new ProcessStartInfo
-        {
-            FileName = "powershell.exe",
-            UseShellExecute = false,
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            CreateNoWindow = true
-        };
-        start.ArgumentList.Add("-NoProfile");
-        start.ArgumentList.Add("-NonInteractive");
-        start.ArgumentList.Add("-Command");
-        start.ArgumentList.Add(script);
 
         try
         {
-            using var process = Process.Start(start);
-            if (process is not null)
+            var result = await ToolRunner.RunAsync(
+                "powershell.exe",
+                ["-NoProfile", "-NonInteractive", "-Command", script],
+                TimeSpan.FromSeconds(8),
+                token);
+
+            if (!result.Success)
             {
-                var outputTask = process.StandardOutput.ReadToEndAsync(token);
-                var errorTask = process.StandardError.ReadToEndAsync(token);
-                await process.WaitForExitAsync(token);
-                var json = await outputTask;
-                var err = await errorTask;
+                diagnostics.Add(new ScanDiagnostic(Name, $"Get-ScheduledTask failed with exit code {result.ExitCode}: {result.StandardError}", IsWarning: true));
+                statusAcc.MarkPartial();
+            }
+            else if (!string.IsNullOrWhiteSpace(result.StandardOutput))
+            {
+                using var document = JsonDocument.Parse(result.StandardOutput);
+                var items = document.RootElement.ValueKind == JsonValueKind.Array
+                    ? document.RootElement.EnumerateArray().ToArray()
+                    : [document.RootElement];
 
-                if (process.ExitCode != 0)
+                foreach (var item in items)
                 {
-                    diagnostics.Add(new ScanDiagnostic(Name, $"Get-ScheduledTask returned exit code {process.ExitCode}: {err}", IsWarning: true));
-                }
-                else if (!string.IsNullOrWhiteSpace(json))
-                {
-                    using var document = JsonDocument.Parse(json);
-                    var items = document.RootElement.ValueKind == JsonValueKind.Array
-                        ? document.RootElement.EnumerateArray().ToArray()
-                        : [document.RootElement];
+                    token.ThrowIfCancellationRequested();
+                    var taskName = JsonString(item, "TaskName");
+                    var taskPath = JsonString(item, "TaskPath");
+                    var execute = JsonString(item, "Execute");
+                    var args = JsonString(item, "Arguments");
+                    var workDir = JsonString(item, "WorkingDirectory");
+                    var action = string.Join(';', execute, args, workDir);
 
-                    foreach (var item in items)
+                    var pathMatch = identity.ReferencesEvidence(action);
+                    var exactNameMatch = identity.CandidateNames.Any(x => taskName.Equals(x, StringComparison.CurrentCultureIgnoreCase));
+
+                    var matchingPre = identity.CapturedTasks.FirstOrDefault(t =>
+                        t.TaskName.Equals(taskName, StringComparison.OrdinalIgnoreCase)
+                        && (string.IsNullOrEmpty(t.TaskPath) || t.TaskPath.Equals(taskPath, StringComparison.OrdinalIgnoreCase)));
+
+                    if (!pathMatch && !exactNameMatch && matchingPre is null) continue;
+
+                    var fullTaskName = (taskPath.EndsWith('\\') ? taskPath : taskPath + "\\") + taskName;
+
+                    OwnershipConfidence confidence;
+                    RiskLevel risk;
+                    bool autoSelect;
+
+                    if (pathMatch)
                     {
-                        token.ThrowIfCancellationRequested();
-                        var taskName = JsonString(item, "TaskName");
-                        var taskPath = JsonString(item, "TaskPath");
-                        var execute = JsonString(item, "Execute");
-                        var args = JsonString(item, "Arguments");
-                        var workDir = JsonString(item, "WorkingDirectory");
-                        var action = string.Join(';', execute, args, workDir);
-
-                        var pathMatch = identity.ReferencesEvidence(action);
-                        var exactNameMatch = identity.CandidateNames.Any(x => taskName.Equals(x, StringComparison.CurrentCultureIgnoreCase));
-                        var preMatch = identity.CapturedTasks.Any(t => t.TaskName.Equals(taskName, StringComparison.OrdinalIgnoreCase));
-
-                        if (!pathMatch && !exactNameMatch && !preMatch) continue;
-
-                        var fullTaskName = (taskPath.EndsWith('\\') ? taskPath : taskPath + "\\") + taskName;
-                        var confidence = (preMatch || pathMatch) ? OwnershipConfidence.Certain : OwnershipConfidence.Medium;
-                        var risk = pathMatch ? RiskLevel.Medium : RiskLevel.High;
-
-                        candidates.Add(new CleanupCandidate
-                        {
-                            Target = fullTaskName,
-                            Kind = CleanupKind.ScheduledTask,
-                            Risk = risk,
-                            Confidence = confidence,
-                            Scope = CleanupScope.System,
-                            Reason = pathMatch
-                                ? "Scheduled task launches a program from the app's installation"
-                                : "Scheduled task matches the app name; review its actions",
-                            SourceProvider = Name,
-                            EvidenceList = [$"Action: {execute} {args}".Trim()],
-                            IsSelected = false // Tasks require review
-                        });
+                        confidence = OwnershipConfidence.Certain;
+                        risk = RiskLevel.Low;
+                        autoSelect = true;
                     }
+                    else if (matchingPre is not null && matchingPre.Confidence == OwnershipConfidence.Certain)
+                    {
+                        confidence = OwnershipConfidence.Certain;
+                        risk = RiskLevel.Low;
+                        autoSelect = true;
+                    }
+                    else
+                    {
+                        // Name-only match remains Medium confidence, Medium risk, unselected
+                        confidence = OwnershipConfidence.Medium;
+                        risk = RiskLevel.Medium;
+                        autoSelect = false;
+                    }
+
+                    var evidence = new List<string> { $"Task name: {fullTaskName}", $"Action: {execute} {args}".Trim() };
+                    if (matchingPre is not null) evidence.AddRange(matchingPre.Evidence);
+
+                    var candidate = new CleanupCandidate
+                    {
+                        Target = fullTaskName,
+                        Kind = CleanupKind.ScheduledTask,
+                        Risk = risk,
+                        Confidence = confidence,
+                        Scope = CleanupScope.System,
+                        Reason = pathMatch
+                            ? "Scheduled task launches a program from the app's installation"
+                            : (matchingPre is not null && matchingPre.Confidence == OwnershipConfidence.Certain
+                                ? "Pre-uninstall verified application task"
+                                : "Scheduled task matches the app name; review before removal"),
+                        SourceProvider = Name,
+                        EvidenceList = evidence,
+                        AutoSelectable = autoSelect
+                    };
+                    candidate.IsSelected = CleanupSelectionPolicy.ShouldAutoSelect(candidate);
+                    candidates.Add(candidate);
                 }
             }
         }
@@ -101,12 +119,13 @@ public sealed class ScheduledTaskProvider : ICleanupArtifactProvider
         catch (Exception ex)
         {
             diagnostics.Add(new ScanDiagnostic(Name, $"Scheduled task scan failed: {ex.Message}", IsError: true, ExceptionDetail: ex.ToString()));
+            statusAcc.MarkFailed();
         }
 
         return new ProviderScanResult
         {
             ProviderName = Name,
-            Status = diagnostics.Any(d => d.IsError) ? ScanStatus.CompleteWithWarnings : ScanStatus.Complete,
+            Status = statusAcc.Status,
             Candidates = candidates,
             Diagnostics = diagnostics,
             Elapsed = sw.Elapsed

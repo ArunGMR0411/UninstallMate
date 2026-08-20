@@ -175,7 +175,7 @@ public sealed class CleanupService
                     string payloadJson = "";
 
                     var (hive, subKey) = CleanupScanner.SplitRegistryPath(item.Target);
-                    var originalIndex = GetEnvironmentPathSegmentIndex(item.Target, item.RegistryViewName, item.Auxiliary, item.EvidencePath);
+                    var (originalIndex, prevSegment, nextSegment) = GetEnvironmentPathSegmentNeighbors(item.Target, item.RegistryViewName, item.Auxiliary, item.EvidencePath);
 
                     if (preserveBackups)
                     {
@@ -186,7 +186,9 @@ public sealed class CleanupService
                             View = item.RegistryViewName,
                             ValueName = item.Auxiliary,
                             RemovedSegment = item.EvidencePath,
-                            OriginalIndex = originalIndex
+                            OriginalIndex = originalIndex,
+                            PreviousSegment = prevSegment,
+                            NextSegment = nextSegment
                         };
                         payloadJson = JsonSerializer.Serialize(pathBackup, new JsonSerializerOptions { WriteIndented = true });
                         backupFile = Path.Combine(sessionFolder, $"env-{index:D3}-{Guid.NewGuid():N}.json");
@@ -246,6 +248,23 @@ public sealed class CleanupService
         }
     }
 
+    public static bool PathEquals(string a, string b)
+    {
+        if (string.IsNullOrWhiteSpace(a) || string.IsNullOrWhiteSpace(b)) return false;
+        var left = a.Trim().Trim('"', '\'').TrimEnd('\\', '/').Replace('/', '\\');
+        var right = b.Trim().Trim('"', '\'').TrimEnd('\\', '/').Replace('/', '\\');
+        return left.Equals(right, StringComparison.OrdinalIgnoreCase);
+    }
+
+    public static bool IsWithin(string candidate, string root)
+    {
+        if (string.IsNullOrWhiteSpace(candidate) || string.IsNullOrWhiteSpace(root)) return false;
+        var c = candidate.Trim().Trim('"', '\'').TrimEnd('\\', '/').Replace('/', '\\');
+        var r = root.Trim().Trim('"', '\'').TrimEnd('\\', '/').Replace('/', '\\');
+        return c.Equals(r, StringComparison.OrdinalIgnoreCase)
+            || c.StartsWith(r + "\\", StringComparison.OrdinalIgnoreCase);
+    }
+
     public static bool IsWithinProtectedWindowsRoot(string path)
     {
         if (string.IsNullOrWhiteSpace(path)) return true;
@@ -253,8 +272,24 @@ public sealed class CleanupService
         {
             var p = path.Trim().Trim('"', '\'').TrimEnd('\\', '/');
 
-            // Explicit check for Windows system roots on any platform
-            var standardRoots = new[]
+            // 1. Root-only protected locations (exact path match only - descendants are allowed if safe)
+            var usersRoot = @"C:\Users";
+            if (PathEquals(p, usersRoot)) return true;
+
+            var userProfile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+            if (!string.IsNullOrEmpty(userProfile) && PathEquals(p, userProfile)) return true;
+
+            var programData = Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData);
+            if (!string.IsNullOrEmpty(programData) && PathEquals(p, programData)) return true;
+
+            var programFiles = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles);
+            if (!string.IsNullOrEmpty(programFiles) && PathEquals(p, programFiles)) return true;
+
+            var programFilesX86 = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86);
+            if (!string.IsNullOrEmpty(programFilesX86) && PathEquals(p, programFilesX86)) return true;
+
+            // 2. Subtree protected locations (entire tree forbidden)
+            var forbiddenSubtrees = new List<string>
             {
                 @"C:\Windows",
                 @"C:\Windows\System32",
@@ -263,7 +298,6 @@ public sealed class CleanupService
                 @"C:\Windows\Installer",
                 @"C:\Windows\System32\DriverStore",
                 @"C:\ProgramData\Microsoft",
-                @"C:\Users",
                 @"/bin",
                 @"/sbin",
                 @"/usr",
@@ -272,45 +306,25 @@ public sealed class CleanupService
                 @"/root"
             };
 
-            foreach (var r in standardRoots)
-            {
-                if (p.Equals(r, StringComparison.OrdinalIgnoreCase)
-                    || p.StartsWith(r + "\\", StringComparison.OrdinalIgnoreCase)
-                    || p.StartsWith(r + "/", StringComparison.OrdinalIgnoreCase))
-                    return true;
-            }
-
             var winDir = Environment.GetFolderPath(Environment.SpecialFolder.Windows);
-            var system = Environment.GetFolderPath(Environment.SpecialFolder.System);
-            var programData = Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData);
-            var userProfile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-
-            var protectedRoots = new List<string>();
             if (!string.IsNullOrEmpty(winDir))
             {
-                protectedRoots.Add(winDir);
-                protectedRoots.Add(Path.Combine(winDir, "System32"));
-                protectedRoots.Add(Path.Combine(winDir, "SysWOW64"));
-                protectedRoots.Add(Path.Combine(winDir, "WinSxS"));
-                protectedRoots.Add(Path.Combine(winDir, "Installer"));
-                protectedRoots.Add(Path.Combine(winDir, "System32", "DriverStore"));
-            }
-            if (!string.IsNullOrEmpty(programData))
-            {
-                protectedRoots.Add(Path.Combine(programData, "Microsoft"));
-            }
-            if (!string.IsNullOrEmpty(userProfile))
-            {
-                protectedRoots.Add(userProfile);
+                forbiddenSubtrees.Add(winDir);
+                forbiddenSubtrees.Add(Path.Combine(winDir, "System32"));
+                forbiddenSubtrees.Add(Path.Combine(winDir, "SysWOW64"));
+                forbiddenSubtrees.Add(Path.Combine(winDir, "WinSxS"));
+                forbiddenSubtrees.Add(Path.Combine(winDir, "Installer"));
+                forbiddenSubtrees.Add(Path.Combine(winDir, "System32", "DriverStore"));
             }
 
-            foreach (var root in protectedRoots)
+            if (!string.IsNullOrEmpty(programData))
             {
-                var r = root.TrimEnd('\\', '/');
-                if (p.Equals(r, StringComparison.OrdinalIgnoreCase)
-                    || p.StartsWith(r + "\\", StringComparison.OrdinalIgnoreCase)
-                    || p.StartsWith(r + "/", StringComparison.OrdinalIgnoreCase))
-                    return true;
+                forbiddenSubtrees.Add(Path.Combine(programData, "Microsoft"));
+            }
+
+            foreach (var r in forbiddenSubtrees)
+            {
+                if (IsWithin(p, r)) return true;
             }
 
             return false;
@@ -481,7 +495,7 @@ public sealed class CleanupService
             {
                 if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
                 {
-                    MoveFileEx(fullPath, null, MoveFileFlags.DelayUntilReboot);
+                    ScheduleRebootDeletion(fullPath);
                     return false;
                 }
                 throw;
@@ -499,17 +513,63 @@ public sealed class CleanupService
             {
                 if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
                 {
-                    foreach (var file in Directory.EnumerateFiles(fullPath, "*", SearchOption.AllDirectories))
-                    {
-                        MoveFileEx(file, null, MoveFileFlags.DelayUntilReboot);
-                    }
-                    MoveFileEx(fullPath, null, MoveFileFlags.DelayUntilReboot);
+                    ScheduleRebootDeletion(fullPath);
                     return false;
                 }
                 throw;
             }
         }
         return true;
+    }
+
+    private static void ScheduleRebootDeletion(string fullPath)
+    {
+        if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows)) return;
+
+        if (File.Exists(fullPath))
+        {
+            if (!MoveFileEx(fullPath, null, MoveFileFlags.DelayUntilReboot))
+            {
+                var error = Marshal.GetLastWin32Error();
+                throw new System.ComponentModel.Win32Exception(error, $"Could not schedule file '{fullPath}' for reboot deletion (Error {error}).");
+            }
+        }
+        else if (Directory.Exists(fullPath))
+        {
+            var files = Directory.EnumerateFiles(fullPath, "*", new EnumerationOptions
+            {
+                RecurseSubdirectories = true,
+                IgnoreInaccessible = true,
+                AttributesToSkip = FileAttributes.ReparsePoint
+            }).ToList();
+
+            foreach (var file in files)
+            {
+                if (!MoveFileEx(file, null, MoveFileFlags.DelayUntilReboot))
+                {
+                    var error = Marshal.GetLastWin32Error();
+                    throw new System.ComponentModel.Win32Exception(error, $"Could not schedule file '{file}' for reboot deletion (Error {error}).");
+                }
+            }
+
+            var dirs = Directory.EnumerateDirectories(fullPath, "*", new EnumerationOptions
+            {
+                RecurseSubdirectories = true,
+                IgnoreInaccessible = true,
+                AttributesToSkip = FileAttributes.ReparsePoint
+            }).OrderByDescending(d => d.Length).ToList();
+
+            foreach (var dir in dirs)
+            {
+                MoveFileEx(dir, null, MoveFileFlags.DelayUntilReboot);
+            }
+
+            if (!MoveFileEx(fullPath, null, MoveFileFlags.DelayUntilReboot))
+            {
+                var error = Marshal.GetLastWin32Error();
+                throw new System.ComponentModel.Win32Exception(error, $"Could not schedule directory '{fullPath}' for reboot deletion (Error {error}).");
+            }
+        }
     }
 
     private static void ClearReadOnlyAttributes(string path)
@@ -580,23 +640,28 @@ public sealed class CleanupService
         key?.DeleteValue(valueName, throwOnMissingValue: false);
     }
 
-    private static int GetEnvironmentPathSegmentIndex(string path, string viewName, string valueName, string evidencePath)
+    private static (int Index, string Prev, string Next) GetEnvironmentPathSegmentNeighbors(string path, string viewName, string valueName, string evidencePath)
     {
-        if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows)) return 0;
+        if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows)) return (0, "", "");
         try
         {
             var (hiveName, subKey) = CleanupScanner.SplitRegistryPath(path);
             using var hive = CleanupScanner.OpenHive(hiveName, viewName);
             using var key = hive.OpenSubKey(subKey);
             var current = Convert.ToString(key?.GetValue(valueName, "", RegistryValueOptions.DoNotExpandEnvironmentNames)) ?? "";
-            var segments = current.Split(';', StringSplitOptions.TrimEntries);
+            var segments = current.Split(';', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
             for (var i = 0; i < segments.Length; i++)
             {
-                if (CleanupScanner.ReferencesEvidencePath(segments[i], [evidencePath])) return i;
+                if (CleanupScanner.ReferencesEvidencePath(segments[i], [evidencePath]))
+                {
+                    var prev = i > 0 ? segments[i - 1] : "";
+                    var next = i + 1 < segments.Length ? segments[i + 1] : "";
+                    return (i, prev, next);
+                }
             }
-            return 0;
+            return (0, "", "");
         }
-        catch { return 0; }
+        catch { return (0, "", ""); }
     }
 
     private static void RemoveEnvironmentPathEntry(

@@ -16,23 +16,25 @@ public sealed partial class KnownDataFolderProvider : ICleanupArtifactProvider
         var sw = Stopwatch.StartNew();
         var candidates = new List<CleanupCandidate>();
         var diagnostics = new List<ScanDiagnostic>();
+        var statusAcc = new ScanStatusAccumulator();
 
         await Task.Run(() =>
         {
             try
             {
-                ScanDataRoots(identity, context, candidates, diagnostics, token);
+                ScanDataRoots(identity, context, candidates, diagnostics, statusAcc, token);
             }
             catch (Exception ex)
             {
                 diagnostics.Add(new ScanDiagnostic(Name, $"Error during known data folder scan: {ex.Message}", IsError: true, ExceptionDetail: ex.ToString()));
+                statusAcc.MarkFailed();
             }
         }, token);
 
         return new ProviderScanResult
         {
             ProviderName = Name,
-            Status = diagnostics.Any(d => d.IsError) ? ScanStatus.CompleteWithWarnings : ScanStatus.Complete,
+            Status = statusAcc.Status,
             Candidates = candidates,
             Diagnostics = diagnostics,
             Elapsed = sw.Elapsed
@@ -44,6 +46,7 @@ public sealed partial class KnownDataFolderProvider : ICleanupArtifactProvider
         CleanupScanContext context,
         List<CleanupCandidate> candidates,
         List<ScanDiagnostic> diagnostics,
+        ScanStatusAccumulator statusAcc,
         CancellationToken token)
     {
         var names = identity.CandidateNames.ToArray();
@@ -64,9 +67,9 @@ public sealed partial class KnownDataFolderProvider : ICleanupArtifactProvider
             foreach (var name in names)
             {
                 token.ThrowIfCancellationRequested();
-                CheckAndAddDirectory(root, name, RiskLevel.Low, OwnershipConfidence.High, "Exact app-named data, cache, log, or temporary folder", candidates, diagnostics, CleanupScope.User);
+                CheckAndAddDirectory(root, name, RiskLevel.Low, OwnershipConfidence.High, "Exact app-named data, cache, log, or temporary folder", candidates, diagnostics, statusAcc, CleanupScope.User);
             }
-            AddPublisherNestedFolders(identity, root, names, candidates, diagnostics, token, RiskLevel.Low, OwnershipConfidence.High, CleanupScope.User);
+            AddPublisherNestedFolders(identity, root, names, candidates, diagnostics, statusAcc, token, RiskLevel.Low, OwnershipConfidence.High, CleanupScope.User);
         }
 
         var programRoots = new[]
@@ -82,15 +85,15 @@ public sealed partial class KnownDataFolderProvider : ICleanupArtifactProvider
             foreach (var name in names)
             {
                 token.ThrowIfCancellationRequested();
-                CheckAndAddDirectory(root, name, RiskLevel.Medium, OwnershipConfidence.High, "Exact app-named program folder remaining after removal", candidates, diagnostics, CleanupScope.Application);
+                CheckAndAddDirectory(root, name, RiskLevel.Medium, OwnershipConfidence.High, "Exact app-named program folder remaining after removal", candidates, diagnostics, statusAcc, CleanupScope.Application);
             }
-            AddPublisherNestedFolders(identity, root, names, candidates, diagnostics, token, RiskLevel.Medium, OwnershipConfidence.High, CleanupScope.Application);
+            AddPublisherNestedFolders(identity, root, names, candidates, diagnostics, statusAcc, token, RiskLevel.Medium, OwnershipConfidence.High, CleanupScope.Application);
         }
 
         if (identity.Kind == ApplicationKind.MicrosoftStore && identity.PackageFamilyName.Length >= 3)
         {
             var packageRoot = Path.Combine(localAppData, "Packages");
-            CheckAndAddDirectory(packageRoot, identity.PackageFamilyName, RiskLevel.Low, OwnershipConfidence.Certain, "Store application's private data folder", candidates, diagnostics, CleanupScope.User);
+            CheckAndAddDirectory(packageRoot, identity.PackageFamilyName, RiskLevel.Low, OwnershipConfidence.Certain, "Store application's private data folder", candidates, diagnostics, statusAcc, CleanupScope.User);
         }
 
         // Personal roots (Documents, Saved Games, dot folders) - high risk, never auto-selected by default
@@ -105,7 +108,7 @@ public sealed partial class KnownDataFolderProvider : ICleanupArtifactProvider
             foreach (var name in names)
             {
                 token.ThrowIfCancellationRequested();
-                CheckAndAddDirectory(root, name, RiskLevel.High, OwnershipConfidence.Medium, "User-created data folder that may contain personal files or projects", candidates, diagnostics, CleanupScope.User, autoSelectable: false);
+                CheckAndAddDirectory(root, name, RiskLevel.High, OwnershipConfidence.Medium, "User-created data folder that may contain personal files or projects", candidates, diagnostics, statusAcc, CleanupScope.User, autoSelectable: false);
             }
         }
 
@@ -114,7 +117,7 @@ public sealed partial class KnownDataFolderProvider : ICleanupArtifactProvider
             var dotName = "." + SlugRegex().Replace(name.ToLowerInvariant(), "");
             if (dotName.Length >= 4)
             {
-                CheckAndAddDirectory(userProfile, dotName, RiskLevel.High, OwnershipConfidence.Medium, "Hidden per-user profile configuration folder", candidates, diagnostics, CleanupScope.User, autoSelectable: false);
+                CheckAndAddDirectory(userProfile, dotName, RiskLevel.High, OwnershipConfidence.Medium, "Hidden per-user profile configuration folder", candidates, diagnostics, statusAcc, CleanupScope.User, autoSelectable: false);
             }
         }
     }
@@ -125,6 +128,7 @@ public sealed partial class KnownDataFolderProvider : ICleanupArtifactProvider
         string[] names,
         List<CleanupCandidate> candidates,
         List<ScanDiagnostic> diagnostics,
+        ScanStatusAccumulator statusAcc,
         CancellationToken token,
         RiskLevel risk,
         OwnershipConfidence confidence,
@@ -142,7 +146,7 @@ public sealed partial class KnownDataFolderProvider : ICleanupArtifactProvider
                 risk == RiskLevel.Low
                     ? "App folder inside its publisher's data folder"
                     : "App folder inside a publisher program folder (publisher root preserved)",
-                candidates, diagnostics, scope);
+                candidates, diagnostics, statusAcc, scope);
         }
     }
 
@@ -154,6 +158,7 @@ public sealed partial class KnownDataFolderProvider : ICleanupArtifactProvider
         string reason,
         List<CleanupCandidate> candidates,
         List<ScanDiagnostic> diagnostics,
+        ScanStatusAccumulator statusAcc,
         CleanupScope scope,
         bool autoSelectable = true)
     {
@@ -165,7 +170,7 @@ public sealed partial class KnownDataFolderProvider : ICleanupArtifactProvider
             var fullPath = Path.GetFullPath(targetPath).TrimEnd(Path.DirectorySeparatorChar);
             var size = CleanupScanner.GetDirectorySize(fullPath);
 
-            candidates.Add(new CleanupCandidate
+            var candidate = new CleanupCandidate
             {
                 Target = fullPath,
                 Kind = CleanupKind.Directory,
@@ -176,17 +181,20 @@ public sealed partial class KnownDataFolderProvider : ICleanupArtifactProvider
                 Scope = scope,
                 SourceProvider = Name,
                 AutoSelectable = autoSelectable && risk == RiskLevel.Low,
-                EvidenceList = [$"Target path: {fullPath}", $"Matched candidate name: {name}"],
-                IsSelected = autoSelectable && risk == RiskLevel.Low && confidence >= OwnershipConfidence.High
-            });
+                EvidenceList = [$"Target path: {fullPath}", $"Matched candidate name: {name}"]
+            };
+            candidate.IsSelected = CleanupSelectionPolicy.ShouldAutoSelect(candidate);
+            candidates.Add(candidate);
         }
         catch (UnauthorizedAccessException ex)
         {
             diagnostics.Add(new ScanDiagnostic(Name, $"Access denied for '{targetPath}'", IsWarning: true, TargetPath: targetPath, ExceptionDetail: ex.Message));
+            statusAcc.MarkAccessDenied();
         }
         catch (Exception ex)
         {
             diagnostics.Add(new ScanDiagnostic(Name, $"Failed checking directory '{targetPath}': {ex.Message}", IsWarning: true, TargetPath: targetPath, ExceptionDetail: ex.Message));
+            statusAcc.MarkWarning();
         }
     }
 
