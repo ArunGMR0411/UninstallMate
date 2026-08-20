@@ -12,6 +12,10 @@
     <Compile Include="..\..\src\UninstallMate\Infrastructure\ObservableObject.cs" Link="ObservableObject.cs" />
     <Compile Include="..\..\src\UninstallMate\Models\InstalledApplication.cs" Link="InstalledApplication.cs" />
     <Compile Include="..\..\src\UninstallMate\Models\CleanupCandidate.cs" Link="CleanupCandidate.cs" />
+    <Compile Include="..\..\src\UninstallMate\Models\OwnershipConfidence.cs" Link="OwnershipConfidence.cs" />
+    <Compile Include="..\..\src\UninstallMate\Models\ProviderScanResult.cs" Link="ProviderScanResult.cs" />
+    <Compile Include="..\..\src\UninstallMate\Models\ApplicationIdentityGraph.cs" Link="ApplicationIdentityGraph.cs" />
+    <Compile Include="..\..\src\UninstallMate\Models\TrackedInstallManifest.cs" Link="TrackedInstallManifest.cs" />
     <Compile Include="..\..\src\UninstallMate\Models\OperationResult.cs" Link="OperationResult.cs" />
     <Compile Include="..\..\src\UninstallMate\Services\CommandLineParser.cs" Link="CommandLineParser.cs" />
     <Compile Include="..\..\src\UninstallMate\Services\AppDiscoveryService.cs" Link="AppDiscoveryService.cs" />
@@ -19,5 +23,24 @@
     <Compile Include="..\..\src\UninstallMate\Services\CleanupService.cs" Link="CleanupService.cs" />
     <Compile Include="..\..\src\UninstallMate\Services\QuarantineService.cs" Link="QuarantineService.cs" />
     <Compile Include="..\..\src\UninstallMate\Services\UninstallService.cs" Link="UninstallService.cs" />
+    <Compile Include="..\..\src\UninstallMate\Services\VerificationService.cs" Link="VerificationService.cs" />
+    <Compile Include="..\..\src\UninstallMate\Services\TrackedInstallService.cs" Link="TrackedInstallService.cs" />
+    <Compile Include="..\..\src\UninstallMate\Services\Providers\CleanupScanContext.cs" Link="Providers\CleanupScanContext.cs" />
+    <Compile Include="..\..\src\UninstallMate\Services\Providers\ICleanupArtifactProvider.cs" Link="Providers\ICleanupArtifactProvider.cs" />
+    <Compile Include="..\..\src\UninstallMate\Services\Providers\InstallLocationProvider.cs" Link="Providers\InstallLocationProvider.cs" />
+    <Compile Include="..\..\src\UninstallMate\Services\Providers\KnownDataFolderProvider.cs" Link="Providers\KnownDataFolderProvider.cs" />
+    <Compile Include="..\..\src\UninstallMate\Services\Providers\ShortcutProvider.cs" Link="Providers\ShortcutProvider.cs" />
+    <Compile Include="..\..\src\UninstallMate\Services\Providers\StartupProvider.cs" Link="Providers\StartupProvider.cs" />
+    <Compile Include="..\..\src\UninstallMate\Services\Providers\RegistryProvider.cs" Link="Providers\RegistryProvider.cs" />
+    <Compile Include="..\..\src\UninstallMate\Services\Providers\EnvironmentProvider.cs" Link="Providers\EnvironmentProvider.cs" />
+    <Compile Include="..\..\src\UninstallMate\Services\Providers\AppPathsProvider.cs" Link="Providers\AppPathsProvider.cs" />
+    <Compile Include="..\..\src\UninstallMate\Services\Providers\ComRegistrationProvider.cs" Link="Providers\ComRegistrationProvider.cs" />
+    <Compile Include="..\..\src\UninstallMate\Services\Providers\ServiceProvider.cs" Link="Providers\ServiceProvider.cs" />
+    <Compile Include="..\..\src\UninstallMate\Services\Providers\ScheduledTaskProvider.cs" Link="Providers\ScheduledTaskProvider.cs" />
+    <Compile Include="..\..\src\UninstallMate\Services\Providers\FirewallRuleProvider.cs" Link="Providers\FirewallRuleProvider.cs" />
+    <Compile Include="..\..\src\UninstallMate\Services\Providers\CrashDumpProvider.cs" Link="Providers\CrashDumpProvider.cs" />
+    <Compile Include="..\..\src\UninstallMate\Services\Providers\FileAssociationProvider.cs" Link="Providers\FileAssociationProvider.cs" />
+    <Compile Include="..\..\src\UninstallMate\Services\Providers\NativeMessagingProvider.cs" Link="Providers\NativeMessagingProvider.cs" />
+    <Compile Include="..\..\src\UninstallMate\Services\Providers\EventLogProvider.cs" Link="Providers\EventLogProvider.cs" />
   </ItemGroup>
 </Project>

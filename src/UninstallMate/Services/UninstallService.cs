@@ -1,5 +1,6 @@
 using Microsoft.Win32;
 using System.Diagnostics;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.RegularExpressions;
 using UninstallMate.Models;
@@ -8,6 +9,11 @@ namespace UninstallMate.Services;
 
 public sealed partial class UninstallService
 {
+    private static readonly HashSet<string> SystemProcessNames = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "explorer", "svchost", "rundll32", "csrss", "smss", "services", "lsass", "winlogon", "dwm", "taskhostw", "conhost", "cmd", "powershell"
+    };
+
     public async Task<bool?> IsApplicationRegisteredAsync(
         InstalledApplication app,
         CancellationToken token)
@@ -54,8 +60,7 @@ public sealed partial class UninstallService
             var initialResult = InterpretDesktopExit(process.ExitCode, registrationStillPresent: true);
             if (initialResult.Success) return initialResult;
 
-            // A surprising number of vendor uninstallers return 1/1603 even after successfully
-            // removing their registration. The registry is the authoritative inventory source.
+            // Wait for registration removal if exit code was nonzero
             if (await WaitForDesktopRegistrationRemovalAsync(app, token))
             {
                 return new(true,
@@ -67,6 +72,67 @@ public sealed partial class UninstallService
         catch (Exception ex) { return new(false, $"Could not run the uninstaller: {ex.Message}"); }
     }
 
+    public static List<Process> FindRunningApplicationProcesses(ApplicationIdentityGraph identity)
+    {
+        var found = new List<Process>();
+        if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows)) return found;
+
+        try
+        {
+            foreach (var proc in Process.GetProcesses())
+            {
+                try
+                {
+                    var procName = proc.ProcessName;
+                    if (SystemProcessNames.Contains(procName)) continue;
+
+                    string? mainModulePath = null;
+                    try { mainModulePath = proc.MainModule?.FileName; } catch { }
+
+                    if (!string.IsNullOrEmpty(mainModulePath))
+                    {
+                        if (identity.ReferencesEvidence(mainModulePath) || identity.MatchesExecutableName(mainModulePath))
+                        {
+                            found.Add(proc);
+                            continue;
+                        }
+                    }
+
+                    if (identity.MatchesExecutableName(procName) || identity.MatchesExecutableName(procName + ".exe"))
+                    {
+                        found.Add(proc);
+                    }
+                }
+                catch { }
+            }
+        }
+        catch { }
+
+        return found;
+    }
+
+    public static async Task CloseApplicationProcessesAsync(ApplicationIdentityGraph identity, CancellationToken token)
+    {
+        var procs = FindRunningApplicationProcesses(identity);
+        foreach (var proc in procs)
+        {
+            try
+            {
+                if (!proc.HasExited)
+                {
+                    proc.CloseMainWindow();
+                    await Task.Delay(200, token);
+                    if (!proc.HasExited)
+                    {
+                        proc.Kill(entireProcessTree: true);
+                    }
+                }
+            }
+            catch { }
+            finally { proc.Dispose(); }
+        }
+    }
+
     private static async Task<OperationResult> RemoveStoreAppAsync(InstalledApplication app, CancellationToken token)
     {
         if (string.IsNullOrWhiteSpace(app.PackageFullName)) return new(false, "Package identity is missing.");
@@ -75,8 +141,7 @@ public sealed partial class UninstallService
             var (exitCode, error) = await RunPowerShellAsync(BuildStoreRemovalScript(app.PackageFullName), token);
             if (exitCode == 0) return new(true, "The Store application was removed.");
 
-            // Deployment APIs occasionally report a nonzero result after completing the removal.
-            // Re-query package registration before showing a failure to the user.
+            // Deployment APIs occasionally report a nonzero result after completing removal
             for (var attempt = 0; attempt < 4; attempt++)
             {
                 var registered = await IsStorePackageRegisteredAsync(app.PackageFullName, token);
@@ -98,7 +163,7 @@ public sealed partial class UninstallService
         catch (Exception ex) { return new(false, $"Package removal failed: {ex.Message}"); }
     }
 
-    internal static OperationResult InterpretDesktopExit(int exitCode, bool registrationStillPresent)
+    public static OperationResult InterpretDesktopExit(int exitCode, bool registrationStillPresent)
     {
         if (!registrationStillPresent && exitCode != 0)
             return new(true, $"The application registration was removed despite uninstaller code {exitCode}.", exitCode);
@@ -126,6 +191,7 @@ public sealed partial class UninstallService
 
     private static bool IsDesktopRegistrationPresent(InstalledApplication app)
     {
+        if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows)) return true;
         try
         {
             var view = app.Architecture == "32-bit" ? RegistryView.Registry32
@@ -140,7 +206,7 @@ public sealed partial class UninstallService
             using var key = baseKey.OpenSubKey(app.RegistryKeyPath[(slash + 1)..]);
             return key is not null;
         }
-        catch { return true; } // A failed verification must never be presented as successful removal.
+        catch { return true; }
     }
 
     private static async Task<bool?> IsStorePackageRegisteredAsync(string packageFullName, CancellationToken token)
@@ -151,7 +217,7 @@ public sealed partial class UninstallService
         return exitCode switch { 0 => false, 1 => true, _ => null };
     }
 
-    internal static string BuildStoreRemovalScript(string packageFullName)
+    public static string BuildStoreRemovalScript(string packageFullName)
     {
         var package = EscapePowerShellLiteral(packageFullName);
         return "$ProgressPreference='SilentlyContinue'; $ErrorActionPreference='Stop'; " +
@@ -163,7 +229,7 @@ public sealed partial class UninstallService
             "if ($removeError) { [Console]::Error.WriteLine($removeError) } else { [Console]::Error.WriteLine('Windows still reports the package as installed.') }; exit 1";
     }
 
-    internal static async Task<(int ExitCode, string Error)> RunPowerShellAsync(string script, CancellationToken token)
+    public static async Task<(int ExitCode, string Error)> RunPowerShellAsync(string script, CancellationToken token)
     {
         var encoded = Convert.ToBase64String(Encoding.Unicode.GetBytes(script));
         var start = new ProcessStartInfo
@@ -195,7 +261,7 @@ public sealed partial class UninstallService
         return line.Length <= 300 ? line : line[..300] + "…";
     }
 
-    internal static string NormalizeMsiCommand(string command)
+    public static string NormalizeMsiCommand(string command)
     {
         if (!MsiExecRegex().IsMatch(command)) return command;
         return InstallSwitchRegex().Replace(command, "$1/X$2", 1);

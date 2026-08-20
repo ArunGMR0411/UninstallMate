@@ -7,6 +7,7 @@ using System.Windows.Data;
 using UninstallMate.Infrastructure;
 using UninstallMate.Models;
 using UninstallMate.Services;
+using UninstallMate.Services.Providers;
 
 namespace UninstallMate.ViewModels;
 
@@ -16,15 +17,18 @@ public sealed class MainViewModel : ObservableObject
     private readonly UninstallService _uninstaller = new();
     private readonly CleanupScanner _scanner = new();
     private readonly CleanupService _cleaner = new();
+    private readonly VerificationService _verifier = new();
     private readonly ICollectionView _appsView;
     private InstalledApplication? _selectedApp;
+    private ApplicationIdentityGraph? _activeIdentity;
     private string _searchText = "";
     private string _status = "Ready";
     private bool _isBusy;
     private bool _includeSystem;
     private bool _quietUninstall;
     private bool _createRestorePoint;
-    private bool _preserveCleanupBackups;
+    private bool _preserveCleanupBackups = true; // Safe default: recovery enabled
+    private bool _isDeepScan;
     private bool _isCleanupReviewVisible;
     private string _lastSessionFolder = QuarantineService.FindLatestRestorableSession() ?? "";
     private CancellationTokenSource? _operation;
@@ -43,6 +47,7 @@ public sealed class MainViewModel : ObservableObject
         {
             if (!SetProperty(ref _selectedApp, value)) return;
             CleanupCandidates.Clear();
+            _activeIdentity = null;
             IsCleanupReviewVisible = false;
             RaisePropertyChanged(nameof(HasSelection));
             RaisePropertyChanged(nameof(HasNoSelection));
@@ -93,6 +98,11 @@ public sealed class MainViewModel : ObservableObject
             if (!SetProperty(ref _preserveCleanupBackups, value)) return;
             RaisePropertyChanged(nameof(CleanupActionLabel));
         }
+    }
+    public bool IsDeepScan
+    {
+        get => _isDeepScan;
+        set => SetProperty(ref _isDeepScan, value);
     }
     public bool HasSelection => SelectedApp is not null;
     public bool HasNoSelection => SelectedApp is null;
@@ -184,6 +194,7 @@ public sealed class MainViewModel : ObservableObject
         if (app is null) return;
         CleanupCandidates.Clear();
         IsCleanupReviewVisible = false;
+
         if (!app.HasUninstaller)
         {
             var scan = await DialogService.ShowAsync(
@@ -198,6 +209,9 @@ public sealed class MainViewModel : ObservableObject
 
         await RunBusyAsync($"Preparing to uninstall {app.DisplayName}…", async token =>
         {
+            Status = $"Capturing pre-uninstall evidence for {app.DisplayName}…";
+            _activeIdentity = await ApplicationIdentityGraph.CaptureAsync(app, token);
+
             if (CreateRestorePoint) Status = await RestorePointService.TryCreateAsync(app.DisplayName, token);
             Status = $"Running {app.DisplayName}'s uninstaller…";
             var result = await _uninstaller.UninstallAsync(app, QuietUninstall, token);
@@ -222,7 +236,7 @@ public sealed class MainViewModel : ObservableObject
             }
 
             Status = result.Message + " Windows confirms removal; scanning for leftovers…";
-            await ScanCoreAsync(app, token);
+            await ScanCoreAsync(_activeIdentity ?? ApplicationIdentityGraph.Create(app), token);
             if (CleanupCandidates.Count == 0)
             {
                 var rediscovered = await RefreshInventoryCoreAsync(app, token);
@@ -237,24 +251,45 @@ public sealed class MainViewModel : ObservableObject
     {
         await RunBusyAsync($"Scanning leftovers for {app.DisplayName}…", async token =>
         {
-            await ScanCoreAsync(app, token);
+            _activeIdentity = await ApplicationIdentityGraph.CaptureAsync(app, token);
+            await ScanCoreAsync(_activeIdentity, token);
         });
     }
 
-    private async Task ScanCoreAsync(InstalledApplication app, CancellationToken token)
+    private async Task ScanCoreAsync(ApplicationIdentityGraph identity, CancellationToken token)
     {
         IsCleanupReviewVisible = false;
-        var candidates = await _scanner.ScanAsync(app, token);
-        CleanupCandidates.Clear();
-        foreach (var candidate in candidates)
+        var progress = new Progress<string>(p => Status = p);
+        var context = new CleanupScanContext
         {
-            candidate.IsSelected = true;
+            IsDeepScan = IsDeepScan,
+            InstalledApplications = Applications.ToList(),
+            PreUninstallIdentity = identity
+        };
+
+        var scanResult = await _scanner.ScanWithDetailsAsync(identity, context, progress, token);
+        CleanupCandidates.Clear();
+        foreach (var candidate in scanResult.Candidates)
+        {
+            // Preserve scanner decision (do NOT force IsSelected = true!)
             CleanupCandidates.Add(candidate);
         }
-        IsCleanupReviewVisible = candidates.Count > 0;
-        Status = candidates.Count == 0
-            ? "No high-confidence leftovers were found."
-            : $"Found and selected {candidates.Count} leftover item(s). Review them on the right, uncheck anything you want to keep, then confirm cleanup.";
+
+        IsCleanupReviewVisible = CleanupCandidates.Count > 0;
+        var autoSelectedCount = CleanupCandidates.Count(x => x.IsSelected);
+        var totalCount = CleanupCandidates.Count;
+
+        if (totalCount == 0)
+        {
+            Status = scanResult.Status == ScanStatus.Complete
+                ? "No high-confidence leftovers were found."
+                : $"Scan completed with status: {scanResult.Status}. No leftovers found.";
+        }
+        else
+        {
+            Status = $"Found {totalCount} leftover item(s) ({autoSelectedCount} safe item(s) selected). Review items on the right and confirm cleanup.";
+        }
+
         RaiseCleanupState();
     }
 
@@ -263,6 +298,7 @@ public sealed class MainViewModel : ObservableObject
         var app = SelectedApp;
         var selected = CleanupCandidates.Where(x => x.IsSelected).ToList();
         if (app is null || selected.Count == 0) return;
+        var identity = _activeIdentity ?? ApplicationIdentityGraph.Create(app);
 
         await RunBusyAsync(PreserveCleanupBackups ? "Creating backup and quarantine…" : "Permanently deleting selected leftovers…", async token =>
         {
@@ -270,7 +306,8 @@ public sealed class MainViewModel : ObservableObject
             var progress = new Progress<string>(message => Status = message);
             var (report, folder) = await _cleaner.ExecuteAsync(app, selected, PreserveCleanupBackups, progress, token);
             if (PreserveCleanupBackups) _lastSessionFolder = folder;
-            var failures = report.Items.Count(x => !x.Success);
+
+            // Remove successfully cleaned items from candidate list
             foreach (var completed in report.Items.Where(x => x.Success))
             {
                 var candidate = CleanupCandidates.FirstOrDefault(x =>
@@ -281,25 +318,25 @@ public sealed class MainViewModel : ObservableObject
                     && x.EvidencePath == completed.EvidencePath);
                 if (candidate is not null) CleanupCandidates.Remove(candidate);
             }
-            Status = failures == 0
-                ? PreserveCleanupBackups
-                    ? $"Cleanup complete. {report.Items.Count} item(s) quarantined or backed up."
-                    : $"Permanent cleanup complete. {report.Items.Count} item(s) deleted."
-                : $"Cleanup completed with {failures} item(s) that could not be removed.";
-            if (failures == 0 && CleanupCandidates.Count == 0)
+
+            // Run post-clean verification scan!
+            Status = "Verifying cleanup status across all providers…";
+            var verification = await _verifier.VerifyAsync(identity, report, progress, token);
+            Status = verification.OutcomeMessage;
+
+            if (verification.Outcome == VerificationOutcome.Clean)
             {
-                var cleanupStatus = Status;
-                var stillRegistered = await RefreshInventoryCoreAsync(app, token);
-                Status = stillRegistered
-                    ? cleanupStatus + " Windows still reports a registration; scan this entry again to review it."
-                    : cleanupStatus + " Application inventory refreshed.";
+                await RefreshInventoryCoreAsync(app, token);
             }
+
             RaiseCleanupState();
-            if (failures > 0)
+            if (verification.Outcome is VerificationOutcome.CleanupIncomplete or VerificationOutcome.ScanIncomplete)
+            {
                 await DialogService.ShowAsync(
                     "Cleanup needs attention",
                     Status + $"\n\nSession report: {Path.Combine(folder, "cleanup-report.json")}",
                     tone: DialogTone.Warning);
+            }
         });
     }
 
@@ -353,7 +390,10 @@ public sealed class MainViewModel : ObservableObject
 
     private void SetCandidateSelection(bool safeOnly)
     {
-        foreach (var candidate in CleanupCandidates) candidate.IsSelected = safeOnly && candidate.Risk == RiskLevel.Low;
+        foreach (var candidate in CleanupCandidates)
+        {
+            candidate.IsSelected = safeOnly && candidate.Risk == RiskLevel.Low && candidate.Confidence >= OwnershipConfidence.High;
+        }
         RaiseCleanupState();
     }
 

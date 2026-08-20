@@ -166,8 +166,10 @@
               <CheckBox Content="Restore point" IsChecked="{Binding CreateRestorePoint}"
                         ToolTip="Ask Windows to create a restore point before uninstall or cleanup" Margin="0,0,0,10" />
               <CheckBox Content="Recovery backup" IsChecked="{Binding PreserveCleanupBackups}"
-                        ToolTip="Keep recoverable copies of removed files and system definitions" />
-              <TextBlock Text="Off by default."
+                        ToolTip="Keep recoverable copies of removed files and system definitions" Margin="0,0,0,10" />
+              <CheckBox Content="Deep scan" IsChecked="{Binding IsDeepScan}"
+                        ToolTip="Perform deep heuristic inspection of related software classes and data folders" />
+              <TextBlock Text="Safe recovery active by default."
                          Foreground="{DynamicResource TextFillColorTertiaryBrush}" FontSize="10"
                          TextWrapping="Wrap" Margin="2,10,0,0" />
             </StackPanel>
@@ -192,7 +194,7 @@
                   CornerRadius="6" Padding="10,8" Margin="0,18,0,0">
             <Grid>
               <TextBlock Text="Version" Foreground="{DynamicResource TextFillColorSecondaryBrush}" />
-              <TextBlock Text="1.6.0" HorizontalAlignment="Right" FontWeight="SemiBold" />
+              <TextBlock Text="2.0.0-hardened" HorizontalAlignment="Right" FontWeight="SemiBold" />
             </Grid>
           </Border>
         </Grid>
@@ -346,7 +348,7 @@
                 <TabItem Header="{Binding ApplicationCleanupCountText}">
                   <Grid>
                     <Grid.RowDefinitions><RowDefinition Height="Auto" /><RowDefinition Height="*" /></Grid.RowDefinitions>
-                    <ui:InfoBar Title="Application files" Message="All detected items are selected. Uncheck anything you want to keep."
+                    <ui:InfoBar Title="Application files" Message="Safe items are pre-selected. Uncheck anything you want to keep."
                                 Severity="Informational" IsOpen="True" IsClosable="False" Margin="0,0,0,7" />
                     <Border Grid.Row="1" Background="{DynamicResource LayerFillColorDefaultBrush}" BorderBrush="{DynamicResource CardStrokeColorDefaultBrush}"
                             BorderThickness="1" CornerRadius="7" ClipToBounds="True">
@@ -354,7 +356,9 @@
                         <DataGrid.Columns>
                           <DataGridCheckBoxColumn Header="" Binding="{Binding IsSelected, UpdateSourceTrigger=PropertyChanged}" Width="36" />
                           <DataGridTextColumn Header="ITEM" Binding="{Binding DisplayTarget}" Width="*" IsReadOnly="True" />
-                          <DataGridTextColumn Header="RISK" Binding="{Binding Risk}" Width="55" IsReadOnly="True" />
+                          <DataGridTextColumn Header="CONFIDENCE" Binding="{Binding ConfidenceText}" Width="75" IsReadOnly="True" />
+                          <DataGridTextColumn Header="RISK" Binding="{Binding RiskText}" Width="55" IsReadOnly="True" />
+                          <DataGridTextColumn Header="PROVIDER" Binding="{Binding SourceProvider}" Width="100" IsReadOnly="True" />
                         </DataGrid.Columns>
                       </DataGrid>
                     </Border>
@@ -363,7 +367,7 @@
                 <TabItem Header="{Binding UserCleanupCountText}">
                   <Grid>
                     <Grid.RowDefinitions><RowDefinition Height="Auto" /><RowDefinition Height="*" /></Grid.RowDefinitions>
-                    <ui:InfoBar Title="User files" Message="All detected items are selected, including possible settings and personal data."
+                    <ui:InfoBar Title="User files" Message="Personal settings and user data are unselected by default for safety. Review before checking."
                                 Severity="Warning" IsOpen="True" IsClosable="False" Margin="0,0,0,7" />
                     <Border Grid.Row="1" Background="{DynamicResource LayerFillColorDefaultBrush}" BorderBrush="{DynamicResource CardStrokeColorDefaultBrush}"
                             BorderThickness="1" CornerRadius="7" ClipToBounds="True">
@@ -371,7 +375,9 @@
                         <DataGrid.Columns>
                           <DataGridCheckBoxColumn Header="" Binding="{Binding IsSelected, UpdateSourceTrigger=PropertyChanged}" Width="36" />
                           <DataGridTextColumn Header="ITEM" Binding="{Binding DisplayTarget}" Width="*" IsReadOnly="True" />
-                          <DataGridTextColumn Header="RISK" Binding="{Binding Risk}" Width="55" IsReadOnly="True" />
+                          <DataGridTextColumn Header="CONFIDENCE" Binding="{Binding ConfidenceText}" Width="75" IsReadOnly="True" />
+                          <DataGridTextColumn Header="RISK" Binding="{Binding RiskText}" Width="55" IsReadOnly="True" />
+                          <DataGridTextColumn Header="PROVIDER" Binding="{Binding SourceProvider}" Width="100" IsReadOnly="True" />
                         </DataGrid.Columns>
                       </DataGrid>
                     </Border>
@@ -380,7 +386,7 @@
                 <TabItem Header="{Binding SystemCleanupCountText}">
                   <Grid>
                     <Grid.RowDefinitions><RowDefinition Height="Auto" /><RowDefinition Height="*" /></Grid.RowDefinitions>
-                    <ui:InfoBar Title="System files" Message="All detected registrations and services are selected. Review carefully."
+                    <ui:InfoBar Title="System files" Message="System registrations, services, and tasks. Review carefully."
                                 Severity="Warning" IsOpen="True" IsClosable="False" Margin="0,0,0,7" />
                     <Border Grid.Row="1" Background="{DynamicResource LayerFillColorDefaultBrush}" BorderBrush="{DynamicResource SystemFillColorCautionBrush}"
                             BorderThickness="1" CornerRadius="7" ClipToBounds="True">
@@ -388,7 +394,9 @@
                         <DataGrid.Columns>
                           <DataGridCheckBoxColumn Header="" Binding="{Binding IsSelected, UpdateSourceTrigger=PropertyChanged}" Width="36" />
                           <DataGridTextColumn Header="ITEM" Binding="{Binding DisplayTarget}" Width="*" IsReadOnly="True" />
-                          <DataGridTextColumn Header="RISK" Binding="{Binding Risk}" Width="55" IsReadOnly="True" />
+                          <DataGridTextColumn Header="CONFIDENCE" Binding="{Binding ConfidenceText}" Width="75" IsReadOnly="True" />
+                          <DataGridTextColumn Header="RISK" Binding="{Binding RiskText}" Width="55" IsReadOnly="True" />
+                          <DataGridTextColumn Header="PROVIDER" Binding="{Binding SourceProvider}" Width="100" IsReadOnly="True" />
                         </DataGrid.Columns>
                       </DataGrid>
                     </Border>
