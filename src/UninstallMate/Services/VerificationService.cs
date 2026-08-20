@@ -44,7 +44,8 @@ public sealed class VerificationService
 
         // 1. Check if any selected cleanup item failed
         var failedItems = cleanupReport.Items.Where(x => !x.Success).ToList();
-        var restartPending = cleanupReport.Items.Any(x => x.Detail.Contains("reboot", StringComparison.OrdinalIgnoreCase));
+        var restartPending = cleanupReport.RestartRequired
+            || cleanupReport.Items.Any(x => x.VerificationStatus == "PendingReboot" || x.Detail.Contains("reboot", StringComparison.OrdinalIgnoreCase));
 
         // 2. Re-discover applications to verify registration removal
         var inventory = await _discovery.DiscoverAsync(includeSystem: true, token);
@@ -59,7 +60,7 @@ public sealed class VerificationService
 
         var scanResult = await _scanner.ScanWithDetailsAsync(identity, context, progress, token);
         var remaining = scanResult.Candidates;
-        var hasProviderFailure = scanResult.Status is ScanStatus.Failed or ScanStatus.AccessDenied;
+        var hasProviderFailure = scanResult.Status is ScanStatus.Failed or ScanStatus.AccessDenied or ScanStatus.Partial;
 
         // 4. Calculate outcome
         VerificationOutcome outcome;
@@ -68,7 +69,7 @@ public sealed class VerificationService
         if (hasProviderFailure)
         {
             outcome = VerificationOutcome.ScanIncomplete;
-            message = "Verification scan incomplete: one or more providers encountered access or system errors.";
+            message = $"Verification scan incomplete: one or more providers reported status '{scanResult.Status}'.";
         }
         else if (failedItems.Count > 0)
         {
@@ -95,8 +96,8 @@ public sealed class VerificationService
         }
         else
         {
-            var hasHighConfidenceRemaining = remaining.Any(r => r.Confidence >= OwnershipConfidence.High && r.Risk == RiskLevel.Low);
-            if (hasHighConfidenceRemaining)
+            var hasAutoSelectableRemaining = remaining.Any(r => r.Confidence.IsAtLeast(OwnershipConfidence.High) && r.Risk == RiskLevel.Low);
+            if (hasAutoSelectableRemaining)
             {
                 outcome = VerificationOutcome.CleanupIncomplete;
                 message = $"Verification found {remaining.Count} remaining leftover item(s).";
@@ -107,6 +108,17 @@ public sealed class VerificationService
                 message = $"Verification complete: {remaining.Count} medium/high-risk or optional items remain for review.";
             }
         }
+
+        cleanupReport.FinalStatus = outcome.ToString();
+        cleanupReport.RestartRequired = restartPending;
+        cleanupReport.Verification = new VerificationReportData
+        {
+            Outcome = outcome.ToString(),
+            OutcomeMessage = message,
+            RemainingCount = remaining.Count,
+            RestartRequired = restartPending,
+            InventoryStillPresent = stillInstalled
+        };
 
         return new VerificationReport
         {

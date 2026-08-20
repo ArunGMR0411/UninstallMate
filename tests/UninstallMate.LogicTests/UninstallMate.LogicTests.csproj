@@ -25,6 +25,7 @@
     <Compile Include="..\..\src\UninstallMate\Services\UninstallService.cs" Link="UninstallService.cs" />
     <Compile Include="..\..\src\UninstallMate\Services\VerificationService.cs" Link="VerificationService.cs" />
     <Compile Include="..\..\src\UninstallMate\Services\TrackedInstallService.cs" Link="TrackedInstallService.cs" />
+    <Compile Include="..\..\src\UninstallMate\Services\IShortcutResolver.cs" Link="IShortcutResolver.cs" />
     <Compile Include="..\..\src\UninstallMate\Services\Providers\CleanupScanContext.cs" Link="Providers\CleanupScanContext.cs" />
     <Compile Include="..\..\src\UninstallMate\Services\Providers\ICleanupArtifactProvider.cs" Link="Providers\ICleanupArtifactProvider.cs" />
     <Compile Include="..\..\src\UninstallMate\Services\Providers\InstallLocationProvider.cs" Link="Providers\InstallLocationProvider.cs" />

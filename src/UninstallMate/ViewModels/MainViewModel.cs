@@ -3,6 +3,7 @@ using System.Collections.ObjectModel;
 using System.Collections.Specialized;
 using System.ComponentModel;
 using System.Diagnostics;
+using System.Reflection;
 using System.Windows.Data;
 using UninstallMate.Infrastructure;
 using UninstallMate.Models;
@@ -39,6 +40,11 @@ public sealed class MainViewModel : ObservableObject
     public ObservableCollection<CleanupCandidate> UserCleanupCandidates { get; } = [];
     public ObservableCollection<CleanupCandidate> SystemCleanupCandidates { get; } = [];
     public ICollectionView ApplicationsView => _appsView;
+
+    public string AppVersionText =>
+        Assembly.GetExecutingAssembly().GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion
+        ?? Assembly.GetExecutingAssembly().GetName().Version?.ToString()
+        ?? "2.0.0";
 
     public InstalledApplication? SelectedApp
     {
@@ -210,7 +216,8 @@ public sealed class MainViewModel : ObservableObject
         await RunBusyAsync($"Preparing to uninstall {app.DisplayName}…", async token =>
         {
             Status = $"Capturing pre-uninstall evidence for {app.DisplayName}…";
-            _activeIdentity = await ApplicationIdentityGraph.CaptureAsync(app, token);
+            var captureResult = await ApplicationIdentityGraph.CaptureWithDiagnosticsAsync(app, token);
+            _activeIdentity = captureResult.Identity;
 
             if (CreateRestorePoint) Status = await RestorePointService.TryCreateAsync(app.DisplayName, token);
             Status = $"Running {app.DisplayName}'s uninstaller…";
@@ -271,7 +278,7 @@ public sealed class MainViewModel : ObservableObject
         CleanupCandidates.Clear();
         foreach (var candidate in scanResult.Candidates)
         {
-            // Preserve scanner decision (do NOT force IsSelected = true!)
+            // Scanner dedup computes selection via CleanupSelectionPolicy
             CleanupCandidates.Add(candidate);
         }
 
@@ -323,6 +330,9 @@ public sealed class MainViewModel : ObservableObject
             Status = "Verifying cleanup status across all providers…";
             var verification = await _verifier.VerifyAsync(identity, report, progress, token);
             Status = verification.OutcomeMessage;
+
+            // Atomically update final report with verification results
+            await CleanupService.SaveReportAtomicallyAsync(report, folder, token);
 
             if (verification.Outcome == VerificationOutcome.Clean)
             {
@@ -392,7 +402,7 @@ public sealed class MainViewModel : ObservableObject
     {
         foreach (var candidate in CleanupCandidates)
         {
-            candidate.IsSelected = safeOnly && candidate.Risk == RiskLevel.Low && candidate.Confidence >= OwnershipConfidence.High;
+            candidate.IsSelected = safeOnly && CleanupSelectionPolicy.ShouldAutoSelect(candidate);
         }
         RaiseCleanupState();
     }

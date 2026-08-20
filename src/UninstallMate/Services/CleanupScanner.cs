@@ -91,6 +91,9 @@ public sealed partial class CleanupScanner
             }
         }
 
+        // Apply shared ownership protection against other installed applications
+        ApplySharedOwnershipProtection(allCandidates, context.InstalledApplications, identity);
+
         var deduplicated = DeduplicateCandidates(allCandidates);
         var finalStatus = AggregateStatus(providerResults);
 
@@ -105,6 +108,62 @@ public sealed partial class CleanupScanner
         };
     }
 
+    public static void ApplySharedOwnershipProtection(
+        List<CleanupCandidate> candidates,
+        IReadOnlyList<InstalledApplication> installedApps,
+        ApplicationIdentityGraph targetApp)
+    {
+        if (installedApps.Count == 0) return;
+
+        var otherApps = installedApps
+            .Where(a => !AppDiscoveryService.SameApplicationIdentity(a, targetApp.Application))
+            .ToList();
+
+        if (otherApps.Count == 0) return;
+
+        for (var i = 0; i < candidates.Count; i++)
+        {
+            var candidate = candidates[i];
+            foreach (var other in otherApps)
+            {
+                var otherInstall = NormalizePath(other.InstallLocation);
+                if (string.IsNullOrWhiteSpace(otherInstall)) continue;
+
+                // Check if filesystem candidate is within or matches another app's install location
+                if (candidate.Kind is CleanupKind.File or CleanupKind.Directory)
+                {
+                    var candPath = NormalizePath(candidate.Target);
+                    if (candPath.Equals(otherInstall, StringComparison.OrdinalIgnoreCase)
+                        || candPath.StartsWith(otherInstall + "\\", StringComparison.OrdinalIgnoreCase)
+                        || candPath.StartsWith(otherInstall + "/", StringComparison.OrdinalIgnoreCase))
+                    {
+                        candidates[i] = new CleanupCandidate
+                        {
+                            Target = candidate.Target,
+                            Kind = candidate.Kind,
+                            Risk = RiskLevel.High,
+                            Confidence = candidate.Confidence,
+                            Reason = $"[Shared Component] Shared with {other.DisplayName} ({candidate.Reason})",
+                            SizeBytes = candidate.SizeBytes,
+                            RegistryViewName = candidate.RegistryViewName,
+                            Auxiliary = candidate.Auxiliary,
+                            EvidencePath = candidate.EvidencePath,
+                            EvidenceList = candidate.EvidenceList.Concat([$"Shared with installed app: {other.DisplayName}"]).ToList(),
+                            SourceProvider = candidate.SourceProvider,
+                            Scope = candidate.Scope,
+                            AutoSelectable = false,
+                            IsSelected = false
+                        };
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    private static string NormalizePath(string path) =>
+        path.Trim().Trim('"', '\'').TrimEnd('\\', '/');
+
     public static IReadOnlyList<CleanupCandidate> DeduplicateCandidates(IEnumerable<CleanupCandidate> source)
     {
         var merged = new Dictionary<string, CleanupCandidate>(StringComparer.OrdinalIgnoreCase);
@@ -114,13 +173,37 @@ public sealed partial class CleanupScanner
             var key = MakeCandidateKey(candidate);
             if (!merged.TryGetValue(key, out var existing))
             {
-                merged[key] = candidate;
+                var single = new CleanupCandidate
+                {
+                    Target = candidate.Target,
+                    Kind = candidate.Kind,
+                    Risk = candidate.Risk,
+                    Confidence = candidate.Confidence,
+                    Reason = candidate.Reason,
+                    SizeBytes = candidate.SizeBytes,
+                    RegistryViewName = candidate.RegistryViewName,
+                    Auxiliary = candidate.Auxiliary,
+                    EvidencePath = candidate.EvidencePath,
+                    EvidenceList = [..candidate.EvidenceList],
+                    SourceProvider = candidate.SourceProvider,
+                    Scope = candidate.Scope,
+                    OriginalExists = candidate.OriginalExists,
+                    DetectedBeforeUninstall = candidate.DetectedBeforeUninstall,
+                    DetectedAfterUninstall = candidate.DetectedAfterUninstall,
+                    RequiresReboot = candidate.RequiresReboot,
+                    AutoSelectable = candidate.AutoSelectable,
+                    RegistryValueKindName = candidate.RegistryValueKindName,
+                    RegistryRawValueBase64 = candidate.RegistryRawValueBase64,
+                    IsSelected = CleanupSelectionPolicy.ShouldAutoSelect(candidate)
+                };
+                merged[key] = single;
             }
             else
             {
-                // Merge candidate evidence and take strongest confidence / lowest risk
-                var mergedConfidence = candidate.Confidence < existing.Confidence ? candidate.Confidence : existing.Confidence;
-                var mergedRisk = candidate.Risk < existing.Risk ? candidate.Risk : existing.Risk;
+                // Safety Invariant: Highest Risk wins, Strongest Confidence wins, AutoSelectable requires BOTH true
+                var mergedConfidence = OwnershipConfidenceExtensions.Strongest(existing.Confidence, candidate.Confidence);
+                var mergedRisk = RiskLevelExtensions.Highest(existing.Risk, candidate.Risk);
+                var mergedAutoSelectable = existing.AutoSelectable && candidate.AutoSelectable;
                 var mergedEvidence = existing.EvidenceList.Concat(candidate.EvidenceList).Distinct().ToList();
 
                 var mergedView = existing.RegistryViewName;
@@ -129,7 +212,7 @@ public sealed partial class CleanupScanner
                     mergedView = "Both";
                 }
 
-                merged[key] = new CleanupCandidate
+                var mergedCandidate = new CleanupCandidate
                 {
                     Target = existing.Target,
                     Kind = existing.Kind,
@@ -147,11 +230,13 @@ public sealed partial class CleanupScanner
                     DetectedBeforeUninstall = existing.DetectedBeforeUninstall || candidate.DetectedBeforeUninstall,
                     DetectedAfterUninstall = existing.DetectedAfterUninstall || candidate.DetectedAfterUninstall,
                     RequiresReboot = existing.RequiresReboot || candidate.RequiresReboot,
-                    AutoSelectable = existing.AutoSelectable && candidate.AutoSelectable,
+                    AutoSelectable = mergedAutoSelectable,
                     RegistryValueKindName = existing.RegistryValueKindName.Length > 0 ? existing.RegistryValueKindName : candidate.RegistryValueKindName,
-                    RegistryRawValueBase64 = existing.RegistryRawValueBase64.Length > 0 ? existing.RegistryRawValueBase64 : candidate.RegistryRawValueBase64,
-                    IsSelected = mergedRisk == RiskLevel.Low && mergedConfidence >= OwnershipConfidence.High
+                    RegistryRawValueBase64 = existing.RegistryRawValueBase64.Length > 0 ? existing.RegistryRawValueBase64 : candidate.RegistryRawValueBase64
                 };
+
+                mergedCandidate.IsSelected = CleanupSelectionPolicy.ShouldAutoSelect(mergedCandidate);
+                merged[key] = mergedCandidate;
             }
         }
 
@@ -159,6 +244,7 @@ public sealed partial class CleanupScanner
 
         return merged.Values
             .OrderBy(x => x.Risk)
+            .ThenByDescending(x => x.Confidence)
             .ThenBy(x => x.Kind)
             .ThenBy(x => x.Target, StringComparer.CurrentCultureIgnoreCase)
             .ToList();
@@ -168,13 +254,13 @@ public sealed partial class CleanupScanner
     {
         return c.Kind switch
         {
-            CleanupKind.RegistryValue => $"val:{c.Target}|{c.Auxiliary}",
+            CleanupKind.RegistryValue => $"val:{c.Target}|{c.Auxiliary}|{c.RegistryViewName}",
             CleanupKind.EnvironmentEntry => $"env:{c.Target}|{c.Auxiliary}",
             CleanupKind.WindowsService => $"svc:{c.Auxiliary}",
             CleanupKind.ScheduledTask => $"task:{c.Target}",
             CleanupKind.FirewallRule => $"fw:{c.Auxiliary}",
             CleanupKind.File or CleanupKind.Directory => $"fs:{Path.GetFullPath(c.Target).TrimEnd(Path.DirectorySeparatorChar)}",
-            CleanupKind.RegistryKey => $"key:{c.Target}",
+            CleanupKind.RegistryKey => $"key:{c.Target}|{c.RegistryViewName}",
             _ => $"{c.Kind}:{c.Target}|{c.Auxiliary}"
         };
     }
@@ -201,7 +287,7 @@ public sealed partial class CleanupScanner
         foreach (var key in nestedKeys) candidates.Remove(key);
     }
 
-    private static ScanStatus AggregateStatus(List<ProviderScanResult> results)
+    public static ScanStatus AggregateStatus(List<ProviderScanResult> results)
     {
         if (results.Count == 0) return ScanStatus.Complete;
         if (results.Any(r => r.Status == ScanStatus.Failed)) return ScanStatus.Failed;
@@ -242,6 +328,9 @@ public sealed partial class CleanupScanner
             if (string.IsNullOrEmpty(rawRoot) || path.Equals(rawRoot, StringComparison.OrdinalIgnoreCase)) return false;
             var root = rawRoot.TrimEnd(Path.DirectorySeparatorChar);
             if (path.Equals(root, StringComparison.OrdinalIgnoreCase)) return false;
+
+            if (CleanupService.IsWithinProtectedWindowsRoot(path)) return false;
+
             var forbidden = new[]
             {
                 Environment.GetFolderPath(Environment.SpecialFolder.Windows),
@@ -254,6 +343,7 @@ public sealed partial class CleanupScanner
                 Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
                 Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments)
             }.Where(x => !string.IsNullOrWhiteSpace(x)).Select(x => Path.GetFullPath(x).TrimEnd(Path.DirectorySeparatorChar));
+
             return !forbidden.Contains(path, StringComparer.OrdinalIgnoreCase)
                 && path.Split(Path.DirectorySeparatorChar, StringSplitOptions.RemoveEmptyEntries).Length >= 2;
         }

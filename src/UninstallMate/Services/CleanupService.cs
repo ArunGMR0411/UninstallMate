@@ -26,10 +26,12 @@ public sealed class CleanupService
         var sessionId = $"{DateTime.Now:yyyyMMdd-HHmmss}-{SafeName(app.DisplayName)}";
         var sessionFolder = Path.Combine(_dataRoot, preserveBackups ? "Quarantine" : "Logs", sessionId);
         Directory.CreateDirectory(sessionFolder);
+
         var report = new CleanupReport
         {
             SessionId = sessionId,
-            ApplicationName = app.DisplayName
+            ApplicationName = app.DisplayName,
+            FinalStatus = "InProgress"
         };
 
         var selectedList = selected.ToList();
@@ -42,18 +44,21 @@ public sealed class CleanupService
             progress?.Report($"Cleaning {++index}/{selectedList.Count}: {DisplayTarget(item)}");
             try
             {
-                var (detail, recoverySource, payloadJson) = await ExecuteItemAsync(
+                var (detail, recoverySource, payloadJson, verificationStatus) = await ExecuteItemAsync(
                     item, preserveBackups, sessionFolder, sessionId, index, token);
 
                 if (item.Kind == CleanupKind.EnvironmentEntry)
                     environmentModified = true;
+
+                if (verificationStatus == "PendingReboot")
+                    report.RestartRequired = true;
 
                 report.Items.Add(new(
                     item.Target, item.Kind, true, detail, recoverySource,
                     item.RegistryViewName, item.Auxiliary, item.EvidencePath,
                     item.Risk, item.Confidence, item.SourceProvider,
                     item.RegistryValueKindName, item.RegistryRawValueBase64,
-                    payloadJson, VerificationStatus: "Deleted"));
+                    payloadJson, VerificationStatus: verificationStatus));
             }
             catch (Exception ex)
             {
@@ -71,16 +76,21 @@ public sealed class CleanupService
         }
 
         report.FinishedAt = DateTimeOffset.Now;
-        var reportPath = Path.Combine(sessionFolder, "cleanup-report.json");
-        await File.WriteAllTextAsync(
-            reportPath,
-            JsonSerializer.Serialize(report, new JsonSerializerOptions { WriteIndented = true }),
-            token);
+        await SaveReportAtomicallyAsync(report, sessionFolder, token);
 
         return (report, sessionFolder);
     }
 
-    private static async Task<(string Detail, string RecoverySource, string PayloadJson)> ExecuteItemAsync(
+    public static async Task SaveReportAtomicallyAsync(CleanupReport report, string sessionFolder, CancellationToken token)
+    {
+        var reportPath = Path.Combine(sessionFolder, "cleanup-report.json");
+        var tmpPath = Path.Combine(sessionFolder, "cleanup-report.json.tmp");
+        var json = JsonSerializer.Serialize(report, new JsonSerializerOptions { WriteIndented = true });
+        await File.WriteAllTextAsync(tmpPath, json, token);
+        File.Move(tmpPath, reportPath, overwrite: true);
+    }
+
+    private static async Task<(string Detail, string RecoverySource, string PayloadJson, string VerificationStatus)> ExecuteItemAsync(
         CleanupCandidate item,
         bool preserveBackups,
         string sessionFolder,
@@ -92,21 +102,34 @@ public sealed class CleanupService
         {
             case CleanupKind.File:
             case CleanupKind.Directory:
-                if (preserveBackups)
                 {
-                    var quarantine = QuarantinePath(item.Target, sessionFolder, sessionId, index);
-                    return (quarantine.Length == 0 ? "Already absent" : "Moved to quarantine", quarantine, "");
+                    if (IsWithinProtectedWindowsRoot(item.Target))
+                        throw new CleanupSafetyException($"Target '{item.Target}' is within a protected Windows directory. Cleanup rejected.");
+
+                    if (preserveBackups)
+                    {
+                        var quarantine = QuarantinePath(item.Target, sessionFolder, sessionId, index);
+                        return (quarantine.Length == 0 ? "Already absent" : "Moved to quarantine", quarantine, "", "Deleted");
+                    }
+
+                    var deleted = DeletePathPermanently(item.Target);
+                    return (deleted ? "Permanently deleted" : "Locked file scheduled for reboot removal", "", "", deleted ? "Deleted" : "PendingReboot");
                 }
-                DeletePathPermanently(item.Target);
-                return ("Permanently deleted", "", "");
 
             case CleanupKind.RegistryKey:
                 {
-                    var backup = preserveBackups
-                        ? await ExportRegistryKeyAsync(item.Target, item.RegistryViewName, sessionFolder, token)
-                        : "";
+                    string backup = "";
+                    if (preserveBackups)
+                    {
+                        backup = await ExportRegistryKeyAsync(item.Target, item.RegistryViewName, sessionFolder, token);
+                        if (string.IsNullOrEmpty(backup) || (!File.Exists(backup) && !Directory.Exists(backup)))
+                        {
+                            if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+                                throw new CleanupSafetyException($"Failed to create registry key backup for '{item.Target}'. No destructive action performed.");
+                        }
+                    }
                     DeleteRegistryKey(item.Target, item.RegistryViewName);
-                    return (preserveBackups ? "Registry key exported, then removed" : "Registry key permanently deleted", backup, "");
+                    return (preserveBackups ? "Registry key exported, then removed" : "Registry key permanently deleted", backup, "", "Deleted");
                 }
 
             case CleanupKind.RegistryValue:
@@ -114,43 +137,64 @@ public sealed class CleanupService
                 {
                     string backupFile = "";
                     string payloadJson = "";
+
                     if (preserveBackups)
                     {
-                        var backupData = CreateRegistryValueBackup(item.Target, item.RegistryViewName, item.Auxiliary);
-                        if (backupData is not null)
+                        if (item.RegistryViewName == "Both")
                         {
-                            payloadJson = JsonSerializer.Serialize(backupData);
-                            backupFile = Path.Combine(sessionFolder, $"regval-{index:D3}-{Guid.NewGuid():N}.json");
+                            var bundle = CreateRegistryValueBundle(item.Target, item.Auxiliary);
+                            if (bundle.Values.Count == 0 && RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+                                throw new CleanupSafetyException($"Failed to backup registry value '{item.Auxiliary}' across views. No destructive action performed.");
+
+                            payloadJson = JsonSerializer.Serialize(bundle, new JsonSerializerOptions { WriteIndented = true });
+                            backupFile = Path.Combine(sessionFolder, $"regbundle-{index:D3}-{Guid.NewGuid():N}.json");
                             await File.WriteAllTextAsync(backupFile, payloadJson, token);
+                        }
+                        else
+                        {
+                            var backupData = CreateRegistryValueBackup(item.Target, item.RegistryViewName, item.Auxiliary);
+                            if (backupData is null && RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+                                throw new CleanupSafetyException($"Failed to backup registry value '{item.Auxiliary}'. No destructive action performed.");
+
+                            if (backupData is not null)
+                            {
+                                payloadJson = JsonSerializer.Serialize(backupData, new JsonSerializerOptions { WriteIndented = true });
+                                backupFile = Path.Combine(sessionFolder, $"regval-{index:D3}-{Guid.NewGuid():N}.json");
+                                await File.WriteAllTextAsync(backupFile, payloadJson, token);
+                            }
                         }
                     }
 
                     DeleteRegistryValue(item.Target, item.RegistryViewName, item.Auxiliary);
-                    return (preserveBackups ? "Registry value saved to backup, then removed" : "Registry value permanently deleted", backupFile, payloadJson);
+                    return (preserveBackups ? "Registry value saved to backup, then removed" : "Registry value permanently deleted", backupFile, payloadJson, "Deleted");
                 }
 
             case CleanupKind.EnvironmentEntry:
                 {
                     string backupFile = "";
                     string payloadJson = "";
+
+                    var (hive, subKey) = CleanupScanner.SplitRegistryPath(item.Target);
+                    var originalIndex = GetEnvironmentPathSegmentIndex(item.Target, item.RegistryViewName, item.Auxiliary, item.EvidencePath);
+
                     if (preserveBackups)
                     {
-                        var (hive, subKey) = CleanupScanner.SplitRegistryPath(item.Target);
                         var pathBackup = new PathSegmentBackupData
                         {
                             Hive = hive.ToString(),
                             SubKey = subKey,
                             View = item.RegistryViewName,
                             ValueName = item.Auxiliary,
-                            RemovedSegment = item.EvidencePath
+                            RemovedSegment = item.EvidencePath,
+                            OriginalIndex = originalIndex
                         };
-                        payloadJson = JsonSerializer.Serialize(pathBackup);
+                        payloadJson = JsonSerializer.Serialize(pathBackup, new JsonSerializerOptions { WriteIndented = true });
                         backupFile = Path.Combine(sessionFolder, $"env-{index:D3}-{Guid.NewGuid():N}.json");
                         await File.WriteAllTextAsync(backupFile, payloadJson, token);
                     }
 
                     RemoveEnvironmentPathEntry(item.Target, item.RegistryViewName, item.Auxiliary, item.EvidencePath);
-                    return (preserveBackups ? "PATH segment saved to backup, then removed" : "App path permanently removed from environment value", backupFile, payloadJson);
+                    return (preserveBackups ? "PATH segment saved to backup, then removed" : "App path permanently removed from environment value", backupFile, payloadJson, "Deleted");
                 }
 
             case CleanupKind.WindowsService:
@@ -160,9 +204,12 @@ public sealed class CleanupService
                     if (preserveBackups)
                     {
                         var serviceBackup = CaptureServiceDefinition(item.Auxiliary);
+                        if (serviceBackup is null && RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+                            throw new CleanupSafetyException($"Failed to capture service definition for '{item.Auxiliary}'. No destructive action performed.");
+
                         if (serviceBackup is not null)
                         {
-                            payloadJson = JsonSerializer.Serialize(serviceBackup);
+                            payloadJson = JsonSerializer.Serialize(serviceBackup, new JsonSerializerOptions { WriteIndented = true });
                             backupFile = Path.Combine(sessionFolder, $"svc-{index:D3}-{Guid.NewGuid():N}.json");
                             await File.WriteAllTextAsync(backupFile, payloadJson, token);
                         }
@@ -174,19 +221,24 @@ public sealed class CleanupService
                         await Task.Delay(250, token);
                         await RunToolAsync("sc.exe", ["delete", item.Auxiliary], token);
                     }
-                    return (preserveBackups ? "Service definition backed up, then service deleted" : "Service permanently deleted", backupFile, payloadJson);
+                    return (preserveBackups ? "Service definition backed up, then service deleted" : "Service permanently deleted", backupFile, payloadJson, "Deleted");
                 }
 
             case CleanupKind.ScheduledTask:
                 {
-                    var backup = preserveBackups && RuntimeInformation.IsOSPlatform(OSPlatform.Windows)
-                        ? await ExportScheduledTaskAsync(item.Target, sessionFolder, token)
-                        : "";
+                    var backup = "";
+                    if (preserveBackups && RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+                    {
+                        backup = await ExportScheduledTaskAsync(item.Target, sessionFolder, token);
+                        if (string.IsNullOrEmpty(backup) || !File.Exists(backup))
+                            throw new CleanupSafetyException($"Failed to export scheduled task '{item.Target}'. No destructive action performed.");
+                    }
+
                     if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
                     {
                         await RunToolAsync("schtasks.exe", ["/delete", "/tn", item.Target, "/f"], token);
                     }
-                    return (preserveBackups ? "Task definition exported, then task deleted" : "Scheduled task permanently deleted", backup, "");
+                    return (preserveBackups ? "Task definition exported, then task deleted" : "Scheduled task permanently deleted", backup, "", "Deleted");
                 }
 
             default:
@@ -194,7 +246,79 @@ public sealed class CleanupService
         }
     }
 
-    private static RegistryValueBackupData? CreateRegistryValueBackup(string path, string viewName, string valueName)
+    public static bool IsWithinProtectedWindowsRoot(string path)
+    {
+        if (string.IsNullOrWhiteSpace(path)) return true;
+        try
+        {
+            var p = path.Trim().Trim('"', '\'').TrimEnd('\\', '/');
+
+            // Explicit check for Windows system roots on any platform
+            var standardRoots = new[]
+            {
+                @"C:\Windows",
+                @"C:\Windows\System32",
+                @"C:\Windows\SysWOW64",
+                @"C:\Windows\WinSxS",
+                @"C:\Windows\Installer",
+                @"C:\Windows\System32\DriverStore",
+                @"C:\ProgramData\Microsoft",
+                @"C:\Users",
+                @"/bin",
+                @"/sbin",
+                @"/usr",
+                @"/etc",
+                @"/var",
+                @"/root"
+            };
+
+            foreach (var r in standardRoots)
+            {
+                if (p.Equals(r, StringComparison.OrdinalIgnoreCase)
+                    || p.StartsWith(r + "\\", StringComparison.OrdinalIgnoreCase)
+                    || p.StartsWith(r + "/", StringComparison.OrdinalIgnoreCase))
+                    return true;
+            }
+
+            var winDir = Environment.GetFolderPath(Environment.SpecialFolder.Windows);
+            var system = Environment.GetFolderPath(Environment.SpecialFolder.System);
+            var programData = Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData);
+            var userProfile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+
+            var protectedRoots = new List<string>();
+            if (!string.IsNullOrEmpty(winDir))
+            {
+                protectedRoots.Add(winDir);
+                protectedRoots.Add(Path.Combine(winDir, "System32"));
+                protectedRoots.Add(Path.Combine(winDir, "SysWOW64"));
+                protectedRoots.Add(Path.Combine(winDir, "WinSxS"));
+                protectedRoots.Add(Path.Combine(winDir, "Installer"));
+                protectedRoots.Add(Path.Combine(winDir, "System32", "DriverStore"));
+            }
+            if (!string.IsNullOrEmpty(programData))
+            {
+                protectedRoots.Add(Path.Combine(programData, "Microsoft"));
+            }
+            if (!string.IsNullOrEmpty(userProfile))
+            {
+                protectedRoots.Add(userProfile);
+            }
+
+            foreach (var root in protectedRoots)
+            {
+                var r = root.TrimEnd('\\', '/');
+                if (p.Equals(r, StringComparison.OrdinalIgnoreCase)
+                    || p.StartsWith(r + "\\", StringComparison.OrdinalIgnoreCase)
+                    || p.StartsWith(r + "/", StringComparison.OrdinalIgnoreCase))
+                    return true;
+            }
+
+            return false;
+        }
+        catch { return true; }
+    }
+
+    public static RegistryValueBackupData? CreateRegistryValueBackup(string path, string viewName, string valueName)
     {
         if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows)) return null;
         try
@@ -208,8 +332,37 @@ public sealed class CleanupService
             if (rawObj is null) return null;
 
             var kind = key.GetValueKind(valueName);
-            var rawBytes = rawObj as byte[] ?? (rawObj is string s ? System.Text.Encoding.Unicode.GetBytes(s) : []);
-            var rawBase64 = Convert.ToBase64String(rawBytes);
+
+            string? stringVal = null;
+            string[]? multiVal = null;
+            int? dwordVal = null;
+            long? qwordVal = null;
+            byte[]? binaryVal = null;
+            string rawBase64 = "";
+
+            switch (kind)
+            {
+                case RegistryValueKind.String:
+                case RegistryValueKind.ExpandString:
+                    stringVal = rawObj.ToString();
+                    break;
+                case RegistryValueKind.MultiString:
+                    multiVal = rawObj as string[];
+                    break;
+                case RegistryValueKind.DWord:
+                    dwordVal = Convert.ToInt32(rawObj);
+                    break;
+                case RegistryValueKind.QWord:
+                    qwordVal = Convert.ToInt64(rawObj);
+                    break;
+                case RegistryValueKind.Binary:
+                    binaryVal = rawObj as byte[];
+                    if (binaryVal is not null) rawBase64 = Convert.ToBase64String(binaryVal);
+                    break;
+                default:
+                    stringVal = rawObj.ToString();
+                    break;
+            }
 
             return new RegistryValueBackupData
             {
@@ -218,11 +371,26 @@ public sealed class CleanupService
                 View = viewName,
                 ValueName = valueName,
                 ValueKind = kind.ToString(),
-                RawValueBase64 = rawBase64,
-                StringValue = rawObj.ToString() ?? ""
+                StringValue = stringVal,
+                MultiStringValue = multiVal,
+                DWordValue = dwordVal,
+                QWordValue = qwordVal,
+                BinaryValue = binaryVal,
+                RawValueBase64 = rawBase64
             };
         }
         catch { return null; }
+    }
+
+    public static RegistryValueBackupBundle CreateRegistryValueBundle(string path, string valueName)
+    {
+        var bundle = new RegistryValueBackupBundle();
+        foreach (var view in new[] { "64", "32" })
+        {
+            var data = CreateRegistryValueBackup(path, view, valueName);
+            if (data is not null) bundle.Values.Add(data);
+        }
+        return bundle;
     }
 
     private static ServiceBackupData? CaptureServiceDefinition(string serviceName)
@@ -239,12 +407,24 @@ public sealed class CleanupService
             var description = Convert.ToString(serviceKey.GetValue("Description")) ?? "";
             var serviceType = Convert.ToInt32(serviceKey.GetValue("Type") ?? 0x10);
             var startType = Convert.ToInt32(serviceKey.GetValue("Start") ?? 2);
+            var errorControl = Convert.ToInt32(serviceKey.GetValue("ErrorControl") ?? 1);
+            var objectName = Convert.ToString(serviceKey.GetValue("ObjectName")) ?? "";
+            var delayed = Convert.ToInt32(serviceKey.GetValue("DelayedAutoStart") ?? 0) != 0;
+            var dependOnService = serviceKey.GetValue("DependOnService") as string[] ?? [];
 
             var serviceDll = "";
+            var paramDict = new Dictionary<string, string>();
             using (var paramsKey = serviceKey.OpenSubKey("Parameters"))
             {
                 if (paramsKey is not null)
+                {
                     serviceDll = Convert.ToString(paramsKey.GetValue("ServiceDll", "", RegistryValueOptions.DoNotExpandEnvironmentNames)) ?? "";
+                    foreach (var val in paramsKey.GetValueNames())
+                    {
+                        var v = paramsKey.GetValue(val)?.ToString();
+                        if (v is not null) paramDict[val] = v;
+                    }
+                }
             }
 
             return new ServiceBackupData
@@ -255,7 +435,12 @@ public sealed class CleanupService
                 ServiceDll = serviceDll,
                 ServiceType = serviceType,
                 StartType = startType,
-                Description = description
+                ErrorControl = errorControl,
+                ServiceAccount = objectName,
+                Dependencies = dependOnService,
+                DelayedAutoStart = delayed,
+                Description = description,
+                Parameters = paramDict
             };
         }
         catch { return null; }
@@ -263,7 +448,7 @@ public sealed class CleanupService
 
     private static string QuarantinePath(string path, string sessionFolder, string sessionId, int index)
     {
-        if (!CleanupScanner.IsSafeSpecificPath(path)) throw new InvalidOperationException("Safety check rejected this path.");
+        if (!CleanupScanner.IsSafeSpecificPath(path)) throw new CleanupSafetyException("Safety check rejected this path.");
         var fullPath = Path.GetFullPath(path);
         if (!File.Exists(fullPath) && !Directory.Exists(fullPath)) return "";
         var name = $"{index:D3}-{SafeName(Path.GetFileName(fullPath))}";
@@ -280,20 +465,51 @@ public sealed class CleanupService
         return destination;
     }
 
-    private static void DeletePathPermanently(string path)
+    private static bool DeletePathPermanently(string path)
     {
-        if (!CleanupScanner.IsSafeSpecificPath(path)) throw new InvalidOperationException("Safety check rejected this path.");
+        if (!CleanupScanner.IsSafeSpecificPath(path)) throw new CleanupSafetyException("Safety check rejected this path.");
         var fullPath = Path.GetFullPath(path);
         if (File.Exists(fullPath))
         {
-            File.SetAttributes(fullPath, FileAttributes.Normal);
-            File.Delete(fullPath);
+            try
+            {
+                File.SetAttributes(fullPath, FileAttributes.Normal);
+                File.Delete(fullPath);
+                return true;
+            }
+            catch (IOException)
+            {
+                if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+                {
+                    MoveFileEx(fullPath, null, MoveFileFlags.DelayUntilReboot);
+                    return false;
+                }
+                throw;
+            }
         }
         else if (Directory.Exists(fullPath))
         {
             ClearReadOnlyAttributes(fullPath);
-            Directory.Delete(fullPath, recursive: true);
+            try
+            {
+                Directory.Delete(fullPath, recursive: true);
+                return true;
+            }
+            catch (IOException)
+            {
+                if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+                {
+                    foreach (var file in Directory.EnumerateFiles(fullPath, "*", SearchOption.AllDirectories))
+                    {
+                        MoveFileEx(file, null, MoveFileFlags.DelayUntilReboot);
+                    }
+                    MoveFileEx(fullPath, null, MoveFileFlags.DelayUntilReboot);
+                    return false;
+                }
+                throw;
+            }
         }
+        return true;
     }
 
     private static void ClearReadOnlyAttributes(string path)
@@ -364,6 +580,25 @@ public sealed class CleanupService
         key?.DeleteValue(valueName, throwOnMissingValue: false);
     }
 
+    private static int GetEnvironmentPathSegmentIndex(string path, string viewName, string valueName, string evidencePath)
+    {
+        if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows)) return 0;
+        try
+        {
+            var (hiveName, subKey) = CleanupScanner.SplitRegistryPath(path);
+            using var hive = CleanupScanner.OpenHive(hiveName, viewName);
+            using var key = hive.OpenSubKey(subKey);
+            var current = Convert.ToString(key?.GetValue(valueName, "", RegistryValueOptions.DoNotExpandEnvironmentNames)) ?? "";
+            var segments = current.Split(';', StringSplitOptions.TrimEntries);
+            for (var i = 0; i < segments.Length; i++)
+            {
+                if (CleanupScanner.ReferencesEvidencePath(segments[i], [evidencePath])) return i;
+            }
+            return 0;
+        }
+        catch { return 0; }
+    }
+
     private static void RemoveEnvironmentPathEntry(
         string path, string viewName, string valueName, string evidencePath)
     {
@@ -399,7 +634,7 @@ public sealed class CleanupService
         return backup;
     }
 
-    private static async Task RunToolAsync(
+    public static async Task RunToolAsync(
         string executable, IEnumerable<string> arguments, CancellationToken token, bool acceptFailure = false)
     {
         using var process = Process.Start(CreateToolStart(executable, arguments))
@@ -431,6 +666,15 @@ public sealed class CleanupService
         }
         catch { }
     }
+
+    [Flags]
+    private enum MoveFileFlags : uint
+    {
+        DelayUntilReboot = 0x4
+    }
+
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    private static extern bool MoveFileEx(string? lpExistingFileName, string? lpNewFileName, MoveFileFlags dwFlags);
 
     [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Auto)]
     private static extern IntPtr SendMessageTimeout(

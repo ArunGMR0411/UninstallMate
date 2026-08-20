@@ -5,6 +5,8 @@ namespace UninstallMate.Services.Providers;
 
 public sealed class ShortcutProvider : ICleanupArtifactProvider
 {
+    private static readonly IShortcutResolver ShortcutResolver = new WindowsShortcutResolver();
+
     public string Name => "Shortcuts";
 
     public async Task<ProviderScanResult> ScanAsync(
@@ -75,6 +77,7 @@ public sealed class ShortcutProvider : ICleanupArtifactProvider
                         Scope = scope,
                         SourceProvider = Name,
                         EvidenceList = [$"Shortcut directory: {fullFolder}"],
+                        AutoSelectable = true,
                         IsSelected = true
                     });
                 }
@@ -102,24 +105,41 @@ public sealed class ShortcutProvider : ICleanupArtifactProvider
             {
                 token.ThrowIfCancellationRequested();
                 var shortcutName = Path.GetFileNameWithoutExtension(file);
-                var matchesName = names.Any(name => ShortcutNameMatches(shortcutName, name));
-                var matchesPreUninstall = identity.CapturedStartupSources.Any(s => s.ValueName.Equals(Path.GetFileName(file), StringComparison.OrdinalIgnoreCase));
 
-                if (matchesName || matchesPreUninstall)
+                var resolution = file.EndsWith(".lnk", StringComparison.OrdinalIgnoreCase)
+                    ? ShortcutResolver.Resolve(file)
+                    : ShortcutResolution.Empty;
+
+                var targetPath = resolution.HasTarget ? resolution.TargetPath : "";
+                var pathMatch = identity.ReferencesEvidence(targetPath);
+                var matchesName = names.Any(name => ShortcutNameMatches(shortcutName, name));
+                var matchesPreUninstall = identity.CapturedStartupSources.Any(s => s.CorrelationKey.ValueName.Equals(shortcutName, StringComparison.OrdinalIgnoreCase));
+
+                if (pathMatch || matchesName || matchesPreUninstall)
                 {
                     var size = 0L;
                     try { size = new FileInfo(file).Length; } catch { }
+
+                    var confidence = pathMatch ? OwnershipConfidence.Certain
+                        : (matchesPreUninstall ? OwnershipConfidence.Certain : OwnershipConfidence.High);
+
+                    var evidence = new List<string> { $"Shortcut file: {file}" };
+                    if (pathMatch) evidence.Add($"Resolved target points to app binary: {targetPath}");
+
                     candidates.Add(new CleanupCandidate
                     {
                         Target = file,
                         Kind = CleanupKind.File,
                         Risk = RiskLevel.Low,
-                        Confidence = matchesPreUninstall ? OwnershipConfidence.Certain : OwnershipConfidence.High,
-                        Reason = "App-named desktop or Start menu shortcut",
+                        Confidence = confidence,
+                        Reason = pathMatch
+                            ? $"Shortcut targets application executable '{targetPath}'"
+                            : "App-named desktop or Start menu shortcut",
                         SizeBytes = size,
                         Scope = scope,
                         SourceProvider = Name,
-                        EvidenceList = [$"Shortcut: {file}"],
+                        EvidenceList = evidence,
+                        AutoSelectable = true,
                         IsSelected = true
                     });
                 }

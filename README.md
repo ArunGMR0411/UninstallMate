@@ -1,43 +1,41 @@
 # UninstallMate
 
-UninstallMate is a Windows 11 desktop uninstaller built with C# and WPF on .NET 8. It inventories classic desktop, MSI, and Microsoft Store/MSIX apps, launches the app's own registered removal mechanism, and then presents high-confidence leftovers for review.
+UninstallMate is a modern Windows 11 desktop uninstaller built with C# and WPF on .NET 8. It discovers classic desktop, MSI, and Microsoft Store/MSIX applications, runs the vendor's uninstaller, captures pre-uninstall evidence in an Application Identity Graph, and presents verified leftover candidates for review with granular confidence and risk grading.
 
-The interface uses the open-source [WPF UI](https://github.com/lepoco/wpfui) Fluent control library with a Windows Settings-inspired responsive layout, a consistent high-contrast dark palette, a Windows-blue accent, an Acrylic backdrop, layered translucent surfaces, and native motion. The bundled WPF UI license is embedded in the application and kept under `src/UninstallMate/Assets`.
+The interface uses the open-source [WPF UI](https://github.com/lepoco/wpfui) Fluent control library with a Windows Settings-inspired responsive layout, a consistent high-contrast dark palette, a Windows-blue accent, an Acrylic backdrop, layered translucent surfaces, and native motion.
 
-The important design rule is that cleanup is never based on a blind whole-disk name search. Every high-confidence candidate is selected for the single right-panel review requested by the user, with risk and scope kept visible so anything that should remain can be unchecked. Optional quarantine moves files and exports system definitions before cleanup; it can be enabled from the left sidebar.
+---
+
+## Safety & Architectural Principles
+
+1. **Evidence Over Loose Names**: Cleanup targets require positive path/provenance attribution correlated against pre-uninstall evidence. Name-only matches are never promoted to `Certain` and are never auto-selected.
+2. **Safe Selection Defaults**: Only **Low Risk + High/Certain Confidence** items are selected by default. User data folders, system services, and environment PATH edits remain unselected by default for safety.
+3. **Value-Level Isolated Backups**: Replaces whole-key registry exports with isolated, value-level JSON records. Restoring a value (such as a Task Manager `StartupApproved` entry) never reverts sibling application values.
+4. **Merge-Safe PATH Restores**: PATH cleanup removes only the application's specific segments; restoring merges only the missing segment without overwriting subsequent unrelated PATH modifications.
+5. **Fail-Closed Recovery**: When recovery mode is active (enabled by default), any failure during backup creation immediately aborts the destructive operation on that item.
+6. **Task Manager / Neat Startup Remnant Purge**: Stale `StartupApproved` binary values in HKCU/HKLM `Run`, `Run32`, and `StartupFolder` are safely identified and cleaned after uninstallation without collateral impact on other apps.
+7. **Modular Artifact Providers**: Monolithic scanning is refactored into 15 specialized providers with structured status reporting (`Complete`, `CompleteWithWarnings`, `Partial`, `AccessDenied`, `Failed`).
+8. **Post-Clean Verification**: Re-runs scan across all providers and verifies application inventory removal to produce graded verification outcomes (`Clean`, `CleanAfterRestart`, `ResidualItemsRequireReview`, `CleanupIncomplete`, `ScanIncomplete`).
+
+---
 
 ## Features
 
 - Discovers 32-bit and 64-bit machine installs, per-user installs, MSI products, and current-user Store/MSIX packages.
-- Hides frameworks, runtimes, drivers, inbox packages and OEM hardware-support components by default; the system-component toggle filters immediately.
 - Resolves packaged-app manifest and Windows AppsFolder metadata so application and publisher columns use friendly names instead of raw identities, certificate subjects, or `ms-resource:` strings.
-- Uses packaged application IDs and executable metadata as safe fallbacks, preventing GUID package identities from being broken into fake application names.
-- Shows installed-application icons by extracting registered EXE/DLL/ICO resources and resolving Store/MSIX `Square44x44Logo` assets, with an initial tile only when Windows provides no usable artwork.
-- Opens registered uninstallers immediately without routine confirmation or completion popups, with dialogs reserved for missing uninstallers and actual operation failures.
-- Shows only the uninstall action before removal; leftover scanning starts automatically after Windows confirms that the registered uninstaller completed.
-- Collapses duplicate registry views and duplicate per-user/machine registrations while keeping different versions and genuinely separate install locations.
-- Finds and cleans every equivalent uninstall registration across user/machine and 32/64-bit registry views, then refreshes inventory automatically after completed cleanup.
-- Search by app, publisher, or version; inspect size, source, install scope, location, and uninstall availability.
-- Uses the exact registered uninstall command, converts MSI install commands to uninstall commands, and understands restart-required MSI exit codes.
-- Verifies Windows registration after nonzero vendor/MSIX exit codes, preventing false “uninstall failed” messages when removal actually succeeded.
-- Offers cleanup-only mode when an uninstaller is missing or broken.
-- Refuses to scan a registered application's live files as leftovers; cleanup starts only after Windows confirms that removal completed, except for the explicit cleanup-only path when no uninstaller exists.
-- Scans registered install locations, exact app/publisher data directories, Store private-data folders, uninstall records, and exact app registry keys.
-- Finds exact application remnants in Local, Roaming, LocalLow, ProgramData, temporary, Program Files, Common Files, Start menu, desktop, startup, Documents, Saved Games, and crash-dump locations.
-- Detects path-backed startup and environment values, App Paths entries, COM registrations, file-association application keys, Windows services and drivers, and scheduled tasks.
-- Separates low-, medium-, and high-risk leftovers. After scanning, every result is selected for a single in-panel review; uncheck anything that should be kept.
-- Keeps the entire leftover-review section hidden during ordinary app browsing and reveals it only after removal is confirmed and leftover results exist.
-- Splits leftovers into dedicated **Application files**, **User files**, and **System files** tabs so custom install directories are never mislabeled as Windows system files; provides Select safe, Select all, and Clear actions.
-- Can create a Windows restore point before changing the system (optional, off by default, and non-blocking).
-- Moves files to a dated quarantine, including same-drive quarantine for apps installed outside C:.
-- Exports registry, service, and scheduled-task definitions before deletion in the default safety mode and always writes a JSON cleanup report.
-- Restores the last cleanup without overwriting anything that now exists at the original location.
-- Keeps quiet uninstall, restore points, and recovery backups off by default; each can be enabled independently from the left sidebar.
-- Remembers the newest restorable quarantine session across restarts and keeps the quarantine folder directly accessible.
-- Exits completely when the main window is closed; UninstallMate has no tray or background mode.
-- Exports the installed-app inventory as CSV and supports cancellation of scans.
+- Hides frameworks, runtimes, drivers, inbox packages, and OEM hardware-support components by default; the system-component toggle filters immediately.
+- Shows installed-application icons by extracting registered EXE/DLL/ICO resources and resolving Store/MSIX `Square44x44Logo` assets.
+- Converts MSI install commands (`/I`) to uninstall commands (`/X`), and handles restart-required MSI exit codes.
+- Pre-uninstall snapshotting captures active startup entries, `.lnk` shortcut targets, services, and scheduled tasks before vendor uninstallers run.
+- Scans registered install locations, exact app/publisher data directories, Store private-data folders, uninstall records, App Paths, COM registrations, Windows services, scheduled tasks, firewall rules, crash dumps, and event logs.
+- Splits leftovers into dedicated **Application files**, **User files**, and **System files** tabs with explicit **Select safe**, **Select all**, and **Clear** actions.
+- Protected cleanup enabled by default: saves value-level registry JSON records, service definitions, scheduled-task XMLs, and moves files to dated quarantine.
+- Restores previous cleanup sessions without overwriting newer data at the destination.
+- Exports the installed-app inventory as CSV and supports cancellation of running operations.
 
-## Build and run
+---
+
+## Build and Run
 
 Requirements: Windows 11 and the [.NET 8 SDK](https://dotnet.microsoft.com/download/dotnet/8.0).
 
@@ -46,44 +44,47 @@ dotnet build .\UninstallMate.sln
 dotnet run --project .\src\UninstallMate\UninstallMate.csproj
 ```
 
-The application requests administrator access at startup because machine-wide uninstallers and registry keys require it.
+The application requests administrator access at startup because machine-wide uninstallers, registry keys, and services require elevation.
 
-To create a portable, self-contained executable (the target PC does not need .NET installed):
+To build the self-contained executable:
 
 ```powershell
 .\scripts\Publish.ps1
 ```
 
-The executable is written to `artifacts\win-x64\UninstallMate.exe`, with a ZIP beside it. For Windows on ARM, run `.\scripts\Publish.ps1 -Runtime win-arm64`.
+The executable is written to `artifacts\win-x64\UninstallMate.exe`, with a ZIP archive beside it. For Windows on ARM, run `.\scripts\Publish.ps1 -Runtime win-arm64`.
 
-Run the build and dependency-free logic checks with `.\scripts\Test.ps1`.
+Run the automated test suite with:
 
-## Recommended workflow
+```powershell
+dotnet run --project .\tests\UninstallMate.LogicTests\UninstallMate.LogicTests.csproj
+```
 
-1. Close the application you want to remove.
-2. Select it in UninstallMate and choose **Uninstall app**. If no uninstaller exists, choose **Cleanup only**.
-3. Complete any prompts from the vendor's uninstaller.
-4. UninstallMate automatically scans after confirmed removal and selects every detected leftover. Review the right panel and uncheck anything you want to keep.
-5. Choose the **Confirm & clean/delete** action in that panel. Cleanup starts immediately without another confirmation window.
+---
 
-Restore points and recovery backups start unchecked. In this mode the right-panel button says **Confirm & delete N** and clicking it performs the reviewed cleanup without another confirmation window. Permanent mode still writes a JSON audit report under `%ProgramData%\UninstallMate\Logs`; this report lists actions but cannot restore deleted data. Enable **Keep backups and quarantine** first if recovery may be needed.
+## Recommended Workflow
 
-Cleanup reports and the primary quarantine live at `%ProgramData%\UninstallMate\Quarantine`. A secondary hidden `.UninstallMate-Quarantine` directory may be created at the root of another drive so large folders can be moved safely without crossing volumes.
+1. Close the application you wish to remove.
+2. Select the application in UninstallMate and choose **Uninstall app** (or **Cleanup only** if no registered uninstaller exists).
+3. Follow any vendor uninstaller prompts.
+4. After Windows confirms removal, UninstallMate automatically scans for leftovers and selects only safe, low-risk items.
+5. Review the items in the tabs on the right, toggle any items as needed, and click **Confirm & clean**.
+6. Post-cleanup verification runs automatically and confirms system state.
 
-## Safety boundaries
+---
 
-No general-purpose uninstaller can prove that every vaguely named file belongs exclusively to one app. Applications may share runtimes, publisher folders, services, drivers, databases, and user documents. UninstallMate therefore uses registered paths or exact identities and labels uncertain items as medium/high risk. In the requested one-panel workflow all findings are initially selected, so those labels and the Application/User/System tabs must be reviewed before confirmation. It intentionally avoids fuzzy whole-disk matches, Windows component-store content, installer/package caches, arbitrary documents, unrelated browser data, and driver-store packages.
+## Project Structure
 
-Store application discovery covers packages registered to the current user. Windows-protected/non-removable packages are shown only when system components are enabled and are not forcibly removed.
+- `src/UninstallMate/Models/` — `ApplicationIdentityGraph`, `CleanupCandidate`, `OwnershipConfidence`, `OperationResult`, `TrackedInstallManifest`
+- `src/UninstallMate/Services/Providers/` — 15 modular artifact providers implementing `ICleanupArtifactProvider`
+- `src/UninstallMate/Services/CleanupScanner.cs` — provider orchestration, candidate deduplication, and shared-ownership protection
+- `src/UninstallMate/Services/CleanupService.cs` — fail-closed deletion, value-level backups, and reboot deletion scheduling
+- `src/UninstallMate/Services/QuarantineService.cs` — typed value restore, bundle view restore, and merge-safe PATH restore
+- `src/UninstallMate/Services/VerificationService.cs` — post-clean multi-provider verification and outcome grading
+- `src/UninstallMate/ViewModels/MainViewModel.cs` & `MainWindow.xaml` — UI layout, data binding, and selection commands
+- `tests/UninstallMate.LogicTests/Program.cs` — automated regression and safety test suite
 
-## Project structure
-
-- `Services/AppDiscoveryService.cs` — registry and Store package inventory
-- `Services/UninstallService.cs` — registered uninstaller/MSI/MSIX execution
-- `Services/CleanupScanner.cs` — conservative leftover discovery and risk grading
-- `Services/CleanupService.cs` — backups, quarantine, and JSON audit report
-- `Services/QuarantineService.cs` — guarded restore workflow
-- `ViewModels/MainViewModel.cs` and `MainWindow.xaml` — UI workflow
+---
 
 ## License
 

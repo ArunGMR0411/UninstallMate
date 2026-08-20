@@ -7,7 +7,7 @@ namespace UninstallMate.Services.Providers;
 
 public sealed class StartupProvider : ICleanupArtifactProvider
 {
-    public string Name => "Startup";
+    public string Name => "StartupEntries";
 
     public async Task<ProviderScanResult> ScanAsync(
         ApplicationIdentityGraph identity,
@@ -27,9 +27,9 @@ public sealed class StartupProvider : ICleanupArtifactProvider
         {
             try
             {
-                ScanRegistryRunValues(identity, context, candidates, diagnostics, token);
-                ScanStartupFolders(identity, context, candidates, diagnostics, token);
-                ScanStartupApprovedValues(identity, context, candidates, diagnostics, token);
+                ScanRunSubKeys(identity, context, candidates, diagnostics, token);
+                ScanStartupFolder(identity, context, candidates, diagnostics, token);
+                ScanStartupApprovedSubKeys(identity, context, candidates, diagnostics, token);
             }
             catch (Exception ex)
             {
@@ -37,59 +37,67 @@ public sealed class StartupProvider : ICleanupArtifactProvider
             }
         }, token);
 
-        var status = diagnostics.Any(d => d.IsError) ? ScanStatus.CompleteWithWarnings : ScanStatus.Complete;
         return new ProviderScanResult
         {
             ProviderName = Name,
-            Status = status,
+            Status = diagnostics.Any(d => d.IsError) ? ScanStatus.CompleteWithWarnings : ScanStatus.Complete,
             Candidates = candidates,
             Diagnostics = diagnostics,
             Elapsed = sw.Elapsed
         };
     }
 
-    private void ScanRegistryRunValues(
+    private void ScanRunSubKeys(
         ApplicationIdentityGraph identity,
         CleanupScanContext context,
         List<CleanupCandidate> candidates,
         List<ScanDiagnostic> diagnostics,
         CancellationToken token)
     {
-        var valueLocations = new[]
+        var runLocations = new[]
         {
-            (RegistryHive.CurrentUser, "HKEY_CURRENT_USER", @"SOFTWARE\Microsoft\Windows\CurrentVersion\Run", RiskLevel.Low, "Startup entry points into the app's installation", CleanupScope.User),
-            (RegistryHive.CurrentUser, "HKEY_CURRENT_USER", @"SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce", RiskLevel.Low, "One-time startup entry points into the app's installation", CleanupScope.User),
-            (RegistryHive.LocalMachine, "HKEY_LOCAL_MACHINE", @"SOFTWARE\Microsoft\Windows\CurrentVersion\Run", RiskLevel.Low, "Machine startup entry points into the app's installation", CleanupScope.System),
-            (RegistryHive.LocalMachine, "HKEY_LOCAL_MACHINE", @"SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce", RiskLevel.Low, "Machine one-time startup entry points into the app's installation", CleanupScope.System)
+            (RegistryHive.CurrentUser, "HKEY_CURRENT_USER", @"SOFTWARE\Microsoft\Windows\CurrentVersion\Run", CleanupScope.User, StartupSourceKind.Run),
+            (RegistryHive.CurrentUser, "HKEY_CURRENT_USER", @"SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce", CleanupScope.User, StartupSourceKind.RunOnce),
+            (RegistryHive.LocalMachine, "HKEY_LOCAL_MACHINE", @"SOFTWARE\Microsoft\Windows\CurrentVersion\Run", CleanupScope.System, StartupSourceKind.Run),
+            (RegistryHive.LocalMachine, "HKEY_LOCAL_MACHINE", @"SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce", CleanupScope.System, StartupSourceKind.RunOnce)
         };
 
-        foreach (var (hive, hiveText, path, risk, reason, scope) in valueLocations)
+        foreach (var (hiveName, hiveText, subKey, scope, kind) in runLocations)
         {
-            foreach (var viewName in new[] { "64", "32" })
+            foreach (var view in new[] { RegistryView.Registry64, RegistryView.Registry32 })
             {
+                var viewName = view == RegistryView.Registry32 ? "32" : "64";
                 token.ThrowIfCancellationRequested();
                 try
                 {
-                    var view = viewName == "32" ? RegistryView.Registry32 : RegistryView.Registry64;
-                    using var baseKey = RegistryKey.OpenBaseKey(hive, view);
-                    using var key = baseKey.OpenSubKey(path);
+                    using var baseKey = RegistryKey.OpenBaseKey(hiveName, view);
+                    using var key = baseKey.OpenSubKey(subKey);
                     if (key is null) continue;
+
                     foreach (var valueName in key.GetValueNames())
                     {
-                        var value = Convert.ToString(key.GetValue(valueName, "", RegistryValueOptions.DoNotExpandEnvironmentNames)) ?? "";
-                        var matchesEvidence = identity.ReferencesEvidence(value);
-                        var matchesCandidateName = identity.CandidateNames.Any(c => c.Equals(valueName, StringComparison.OrdinalIgnoreCase));
-                        var matchesPreUninstall = identity.CapturedStartupSources.Any(s =>
-                            s.Hive.Equals(hiveText, StringComparison.OrdinalIgnoreCase)
-                            && s.SubKey.Equals(path, StringComparison.OrdinalIgnoreCase)
-                            && s.ValueName.Equals(valueName, StringComparison.OrdinalIgnoreCase));
+                        var command = Convert.ToString(key.GetValue(valueName, "", RegistryValueOptions.DoNotExpandEnvironmentNames)) ?? "";
+                        var pathMatch = identity.ReferencesEvidence(command);
+                        var nameMatch = identity.CandidateNames.Any(c => c.Equals(valueName, StringComparison.OrdinalIgnoreCase));
 
-                        if (!matchesEvidence && !matchesCandidateName && !matchesPreUninstall) continue;
+                        if (!pathMatch && !nameMatch) continue;
 
-                        var confidence = matchesPreUninstall || matchesEvidence ? OwnershipConfidence.Certain : OwnershipConfidence.High;
-                        var rawValueObj = key.GetValue(valueName);
-                        var kind = key.GetValueKind(valueName);
-                        var target = $@"{hiveText}\{path}";
+                        var confidence = pathMatch ? OwnershipConfidence.Certain : OwnershipConfidence.Medium;
+                        var risk = pathMatch ? RiskLevel.Low : RiskLevel.Medium;
+                        var autoSelect = CleanupSelectionPolicy.ShouldAutoSelect(new CleanupCandidate
+                        {
+                            Target = $@"{hiveText}\{subKey}",
+                            Kind = CleanupKind.RegistryValue,
+                            Risk = risk,
+                            Confidence = confidence,
+                            Reason = "",
+                            AutoSelectable = pathMatch
+                        });
+
+                        var target = $@"{hiveText}\{subKey}";
+                        var reason = pathMatch
+                            ? $"Startup entry launches application binary from '{command}'"
+                            : $"Startup entry name '{valueName}' matches application name; command requires review";
 
                         candidates.Add(new CleanupCandidate
                         {
@@ -100,85 +108,89 @@ public sealed class StartupProvider : ICleanupArtifactProvider
                             Risk = risk,
                             Confidence = confidence,
                             Scope = scope,
-                            Reason = $"{reason} ({viewName}-bit view)",
+                            Reason = reason,
                             SourceProvider = Name,
-                            RegistryValueKindName = kind.ToString(),
-                            RegistryRawValueBase64 = rawValueObj is byte[] bytes ? Convert.ToBase64String(bytes) : (rawValueObj?.ToString() ?? ""),
-                            EvidenceList = [$"Value: {value}", $"Matched startup source '{valueName}'"],
-                            IsSelected = risk == RiskLevel.Low && confidence >= OwnershipConfidence.High
+                            RegistryValueKindName = "String",
+                            RegistryRawValueBase64 = command,
+                            AutoSelectable = pathMatch,
+                            EvidenceList = [$"Command: {command}", $"View: {viewName}-bit"],
+                            IsSelected = autoSelect
                         });
                     }
                 }
                 catch (UnauthorizedAccessException ex)
                 {
-                    diagnostics.Add(new ScanDiagnostic(Name, $"Access denied scanning {hiveText}\\{path}", IsWarning: true, TargetPath: $@"{hiveText}\{path}", ExceptionDetail: ex.Message));
+                    diagnostics.Add(new ScanDiagnostic(Name, $"Access denied reading {hiveText}\\{subKey}", IsWarning: true, TargetPath: $@"{hiveText}\{subKey}", ExceptionDetail: ex.Message));
                 }
                 catch (Exception ex)
                 {
-                    diagnostics.Add(new ScanDiagnostic(Name, $"Failed scanning {hiveText}\\{path}: {ex.Message}", IsWarning: true, TargetPath: $@"{hiveText}\{path}", ExceptionDetail: ex.Message));
+                    diagnostics.Add(new ScanDiagnostic(Name, $"Failed scanning {hiveText}\\{subKey}: {ex.Message}", IsWarning: true, TargetPath: $@"{hiveText}\{subKey}", ExceptionDetail: ex.Message));
                 }
             }
         }
     }
 
-    private void ScanStartupFolders(
+    private void ScanStartupFolder(
         ApplicationIdentityGraph identity,
         CleanupScanContext context,
         List<CleanupCandidate> candidates,
         List<ScanDiagnostic> diagnostics,
         CancellationToken token)
     {
-        var roots = new[]
+        var shortcutResolver = new WindowsShortcutResolver();
+        var startupFolders = new[]
         {
             (Environment.GetFolderPath(Environment.SpecialFolder.Startup), CleanupScope.User),
             (Environment.GetFolderPath(Environment.SpecialFolder.CommonStartup), CleanupScope.System)
-        }.Where(r => Directory.Exists(r.Item1)).DistinctBy(r => r.Item1, StringComparer.OrdinalIgnoreCase);
+        };
 
-        foreach (var (folder, scope) in roots)
+        foreach (var (folder, scope) in startupFolders)
         {
-            token.ThrowIfCancellationRequested();
+            if (string.IsNullOrWhiteSpace(folder) || !Directory.Exists(folder)) continue;
             try
             {
-                foreach (var file in Directory.EnumerateFiles(folder, "*", SearchOption.TopDirectoryOnly))
+                foreach (var file in Directory.EnumerateFiles(folder, "*.*", SearchOption.TopDirectoryOnly))
                 {
-                    var ext = Path.GetExtension(file);
-                    if (!ext.Equals(".lnk", StringComparison.OrdinalIgnoreCase) && !ext.Equals(".url", StringComparison.OrdinalIgnoreCase))
-                        continue;
-
+                    token.ThrowIfCancellationRequested();
                     var name = Path.GetFileNameWithoutExtension(file);
-                    var matchesName = identity.CandidateNames.Any(c => c.Equals(name, StringComparison.OrdinalIgnoreCase))
-                        || identity.CandidateNames.Any(c => name.Equals($"Uninstall {c}", StringComparison.OrdinalIgnoreCase) || name.Equals($"{c} Uninstall", StringComparison.OrdinalIgnoreCase));
+                    var resolution = file.EndsWith(".lnk", StringComparison.OrdinalIgnoreCase)
+                        ? shortcutResolver.Resolve(file)
+                        : ShortcutResolution.Empty;
 
-                    var matchesPreUninstall = identity.CapturedStartupSources.Any(s => s.ValueName.Equals(Path.GetFileName(file), StringComparison.OrdinalIgnoreCase) || s.ValueName.Equals(name, StringComparison.OrdinalIgnoreCase));
+                    var targetPath = resolution.HasTarget ? resolution.TargetPath : file;
+                    var pathMatch = identity.ReferencesEvidence(targetPath);
+                    var nameMatch = identity.CandidateNames.Any(c => c.Equals(name, StringComparison.OrdinalIgnoreCase));
 
-                    if (matchesName || matchesPreUninstall)
+                    if (!pathMatch && !nameMatch) continue;
+
+                    var confidence = pathMatch ? OwnershipConfidence.Certain : OwnershipConfidence.Medium;
+                    var risk = pathMatch ? RiskLevel.Low : RiskLevel.Medium;
+
+                    candidates.Add(new CleanupCandidate
                     {
-                        var size = 0L;
-                        try { size = new FileInfo(file).Length; } catch { }
-                        candidates.Add(new CleanupCandidate
-                        {
-                            Target = file,
-                            Kind = CleanupKind.File,
-                            Risk = RiskLevel.Low,
-                            Confidence = matchesPreUninstall ? OwnershipConfidence.Certain : OwnershipConfidence.High,
-                            Reason = "Startup folder shortcut for the removed application",
-                            Scope = scope,
-                            SizeBytes = size,
-                            SourceProvider = Name,
-                            EvidenceList = [$"Startup shortcut file: {file}"],
-                            IsSelected = true
-                        });
-                    }
+                        Target = file,
+                        Kind = CleanupKind.File,
+                        Risk = risk,
+                        Confidence = confidence,
+                        Scope = scope,
+                        Reason = pathMatch
+                            ? $"Startup folder shortcut targets application binary '{targetPath}'"
+                            : $"Startup folder item '{name}' matches application name",
+                        SourceProvider = Name,
+                        AutoSelectable = pathMatch,
+                        EvidenceList = [$"Target: {targetPath}"],
+                        IsSelected = pathMatch
+                    });
                 }
             }
             catch (Exception ex)
             {
-                diagnostics.Add(new ScanDiagnostic(Name, $"Failed reading startup folder '{folder}': {ex.Message}", IsWarning: true, TargetPath: folder));
+                diagnostics.Add(new ScanDiagnostic(Name, $"Failed scanning startup folder {folder}: {ex.Message}", IsWarning: true, TargetPath: folder));
             }
         }
     }
 
-    private void ScanStartupApprovedValues(
+    private void ScanStartupApprovedSubKeys(
         ApplicationIdentityGraph identity,
         CleanupScanContext context,
         List<CleanupCandidate> candidates,
@@ -187,75 +199,59 @@ public sealed class StartupProvider : ICleanupArtifactProvider
     {
         var approvedLocations = new[]
         {
-            (RegistryHive.CurrentUser, "HKEY_CURRENT_USER", @"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run", CleanupScope.User),
-            (RegistryHive.CurrentUser, "HKEY_CURRENT_USER", @"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run32", CleanupScope.User),
-            (RegistryHive.CurrentUser, "HKEY_CURRENT_USER", @"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\StartupFolder", CleanupScope.User),
-            (RegistryHive.LocalMachine, "HKEY_LOCAL_MACHINE", @"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run", CleanupScope.System),
-            (RegistryHive.LocalMachine, "HKEY_LOCAL_MACHINE", @"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run32", CleanupScope.System),
-            (RegistryHive.LocalMachine, "HKEY_LOCAL_MACHINE", @"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\StartupFolder", CleanupScope.System)
+            (RegistryHive.CurrentUser, "HKEY_CURRENT_USER", @"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run", CleanupScope.User, StartupSourceKind.Run),
+            (RegistryHive.CurrentUser, "HKEY_CURRENT_USER", @"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run32", CleanupScope.User, StartupSourceKind.Run),
+            (RegistryHive.CurrentUser, "HKEY_CURRENT_USER", @"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\StartupFolder", CleanupScope.User, StartupSourceKind.StartupFolder),
+            (RegistryHive.LocalMachine, "HKEY_LOCAL_MACHINE", @"SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run", CleanupScope.System, StartupSourceKind.Run),
+            (RegistryHive.LocalMachine, "HKEY_LOCAL_MACHINE", @"SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run32", CleanupScope.System, StartupSourceKind.Run),
+            (RegistryHive.LocalMachine, "HKEY_LOCAL_MACHINE", @"SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\StartupFolder", CleanupScope.System, StartupSourceKind.StartupFolder)
         };
 
-        foreach (var (hive, hiveText, subKey, scope) in approvedLocations)
+        foreach (var (hiveName, hiveText, subKey, scope, kind) in approvedLocations)
         {
-            foreach (var viewName in new[] { "64", "32" })
+            foreach (var view in new[] { RegistryView.Registry64, RegistryView.Registry32 })
             {
+                var viewName = view == RegistryView.Registry32 ? "32" : "64";
                 token.ThrowIfCancellationRequested();
                 try
                 {
-                    var view = viewName == "32" ? RegistryView.Registry32 : RegistryView.Registry64;
-                    using var baseKey = RegistryKey.OpenBaseKey(hive, view);
+                    using var baseKey = RegistryKey.OpenBaseKey(hiveName, view);
                     using var key = baseKey.OpenSubKey(subKey);
                     if (key is null) continue;
 
                     foreach (var valueName in key.GetValueNames())
                     {
-                        var stemName = Path.GetFileNameWithoutExtension(valueName);
+                        var correlationKey = new StartupCorrelationKey(hiveName, view, kind, valueName);
 
-                        // Check correlation against pre-uninstall snapshot
-                        var preApproved = identity.CapturedStartupApprovedEntries.FirstOrDefault(e =>
-                            e.Hive.Equals(hiveText, StringComparison.OrdinalIgnoreCase)
-                            && e.SubKey.Equals(subKey, StringComparison.OrdinalIgnoreCase)
-                            && e.ValueName.Equals(valueName, StringComparison.OrdinalIgnoreCase));
+                        // Safe Correlation Requirement:
+                        // 1. Must match exact correlation key against a pre-uninstall startup source captured with High/Certain confidence
+                        var matchingSource = identity.CapturedStartupSources.FirstOrDefault(s =>
+                            s.CorrelationKey == correlationKey
+                            && s.Confidence.IsAtLeast(OwnershipConfidence.High));
 
-                        var preStartupSource = identity.CapturedStartupSources.FirstOrDefault(s =>
-                            s.ValueName.Equals(valueName, StringComparison.OrdinalIgnoreCase)
-                            || s.ValueName.Equals(stemName, StringComparison.OrdinalIgnoreCase));
+                        // 2. Or fallback name match (strictly Medium confidence, not auto-selected)
+                        var nameMatch = identity.CandidateNames.Any(c => c.Equals(valueName, StringComparison.OrdinalIgnoreCase));
 
-                        var exactCandidateMatch = identity.CandidateNames.FirstOrDefault(c =>
-                            c.Equals(valueName, StringComparison.OrdinalIgnoreCase)
-                            || c.Equals(stemName, StringComparison.OrdinalIgnoreCase));
+                        if (matchingSource is null && !nameMatch) continue;
 
-                        var exeMatch = identity.ExecutableNames.FirstOrDefault(e =>
-                            e.Equals(valueName, StringComparison.OrdinalIgnoreCase)
-                            || Path.GetFileNameWithoutExtension(e).Equals(valueName, StringComparison.OrdinalIgnoreCase)
-                            || Path.GetFileNameWithoutExtension(e).Equals(stemName, StringComparison.OrdinalIgnoreCase));
-
-                        if (preApproved is null && preStartupSource is null && exactCandidateMatch is null && exeMatch is null)
-                            continue;
-
-                        var confidence = (preApproved is not null || preStartupSource is not null)
-                            ? OwnershipConfidence.Certain
-                            : (exactCandidateMatch is not null || exeMatch is not null ? OwnershipConfidence.High : OwnershipConfidence.Medium);
-
-                        var rawObj = key.GetValue(valueName);
-                        var rawBytes = rawObj as byte[] ?? [];
+                        var rawBytes = key.GetValue(valueName) as byte[] ?? [];
                         var rawBase64 = Convert.ToBase64String(rawBytes);
-                        var kind = key.GetValueKind(valueName);
+
+                        var isCertain = matchingSource is not null;
+                        var confidence = isCertain ? OwnershipConfidence.Certain : OwnershipConfidence.Medium;
+                        var risk = RiskLevel.Low;
+                        var autoSelect = isCertain;
 
                         var target = $@"{hiveText}\{subKey}";
-                        var reason = preStartupSource is not null
-                            ? $"Stale Task Manager startup entry left behind after the '{preStartupSource.ValueName}' startup source was removed"
-                            : "Stale Task Manager startup approval entry matching the application identity";
+                        var reason = isCertain
+                            ? $"Stale Task Manager startup entry left behind after the '{valueName}' startup source was removed"
+                            : $"Task Manager startup entry name '{valueName}' matches application candidate name; review before removal";
 
-                        var evidence = new List<string>();
-                        if (preStartupSource is not null)
-                            evidence.Add($"Correlated with pre-uninstall startup source '{preStartupSource.ValueName}' in {preStartupSource.SubKey}");
-                        if (preApproved is not null)
-                            evidence.Add($"Captured in pre-uninstall snapshot as {preApproved.CorrelatedSource}");
-                        if (exactCandidateMatch is not null)
-                            evidence.Add($"Value name matches application name '{exactCandidateMatch}'");
-                        if (exeMatch is not null)
-                            evidence.Add($"Value name matches application executable '{exeMatch}'");
+                        var evidence = new List<string> { $"Value name: {valueName}", $"View: {viewName}-bit" };
+                        if (matchingSource is not null)
+                        {
+                            evidence.Add($"Pre-uninstall correlated source: {matchingSource.RegistryPath} ({matchingSource.CommandOrShortcutPath})");
+                        }
 
                         candidates.Add(new CleanupCandidate
                         {
@@ -263,25 +259,26 @@ public sealed class StartupProvider : ICleanupArtifactProvider
                             Auxiliary = valueName,
                             Kind = CleanupKind.RegistryValue,
                             RegistryViewName = viewName,
-                            Risk = RiskLevel.Low,
+                            Risk = risk,
                             Confidence = confidence,
                             Scope = scope,
                             Reason = reason,
                             SourceProvider = Name,
-                            RegistryValueKindName = kind.ToString(),
+                            RegistryValueKindName = "Binary",
                             RegistryRawValueBase64 = rawBase64,
+                            AutoSelectable = autoSelect,
                             EvidenceList = evidence,
-                            IsSelected = confidence >= OwnershipConfidence.High
+                            IsSelected = autoSelect
                         });
                     }
                 }
                 catch (UnauthorizedAccessException ex)
                 {
-                    diagnostics.Add(new ScanDiagnostic(Name, $"Access denied scanning StartupApproved {hiveText}\\{subKey}", IsWarning: true, TargetPath: $@"{hiveText}\{subKey}", ExceptionDetail: ex.Message));
+                    diagnostics.Add(new ScanDiagnostic(Name, $"Access denied reading StartupApproved key {hiveText}\\{subKey}", IsWarning: true, TargetPath: $@"{hiveText}\{subKey}", ExceptionDetail: ex.Message));
                 }
                 catch (Exception ex)
                 {
-                    diagnostics.Add(new ScanDiagnostic(Name, $"Failed scanning StartupApproved {hiveText}\\{subKey}: {ex.Message}", IsWarning: true, TargetPath: $@"{hiveText}\{subKey}", ExceptionDetail: ex.Message));
+                    diagnostics.Add(new ScanDiagnostic(Name, $"Failed scanning StartupApproved in {hiveText}\\{subKey}: {ex.Message}", IsWarning: true, TargetPath: $@"{hiveText}\{subKey}", ExceptionDetail: ex.Message));
                 }
             }
         }

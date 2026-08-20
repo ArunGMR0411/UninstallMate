@@ -35,7 +35,7 @@ public static class QuarantineService
         {
             var report = JsonSerializer.Deserialize<CleanupReport>(File.ReadAllText(reportPath));
             return report?.Items.Any(x => x.Success
-                && (x.RecoverySource.Length > 0 && (File.Exists(x.RecoverySource) || Directory.Exists(x.RecoverySource))
+                && ((x.RecoverySource.Length > 0 && (File.Exists(x.RecoverySource) || Directory.Exists(x.RecoverySource)))
                     || !string.IsNullOrEmpty(x.StructuredPayloadJson))) == true;
         }
         catch { return false; }
@@ -113,20 +113,44 @@ public static class QuarantineService
 
     private static async Task RestoreRegistryValueAsync(CleanupReportItem item, CancellationToken token)
     {
-        RegistryValueBackupData? backupData = null;
+        string? json = null;
         if (!string.IsNullOrEmpty(item.StructuredPayloadJson))
         {
-            backupData = JsonSerializer.Deserialize<RegistryValueBackupData>(item.StructuredPayloadJson);
+            json = item.StructuredPayloadJson;
         }
         else if (item.RecoverySource.Length > 0 && File.Exists(item.RecoverySource) && item.RecoverySource.EndsWith(".json", StringComparison.OrdinalIgnoreCase))
         {
-            backupData = JsonSerializer.Deserialize<RegistryValueBackupData>(await File.ReadAllTextAsync(item.RecoverySource, token));
+            json = await File.ReadAllTextAsync(item.RecoverySource, token);
         }
 
-        if (backupData is not null)
+        if (!string.IsNullOrEmpty(json))
         {
-            RestoreExactValue(backupData);
-            return;
+            // Try bundle first
+            try
+            {
+                var bundle = JsonSerializer.Deserialize<RegistryValueBackupBundle>(json);
+                if (bundle is not null && bundle.Values.Count > 0)
+                {
+                    foreach (var val in bundle.Values)
+                    {
+                        RestoreExactValue(val);
+                    }
+                    return;
+                }
+            }
+            catch { }
+
+            // Try single value
+            try
+            {
+                var backupData = JsonSerializer.Deserialize<RegistryValueBackupData>(json);
+                if (backupData is not null)
+                {
+                    RestoreExactValue(backupData);
+                    return;
+                }
+            }
+            catch { }
         }
 
         // Fallback for legacy .reg exports
@@ -150,30 +174,30 @@ public static class QuarantineService
         if (key is null) throw new InvalidOperationException($"Could not open or create subkey: {data.SubKey}");
 
         var kind = Enum.TryParse<RegistryValueKind>(data.ValueKind, out var parsedKind) ? parsedKind : RegistryValueKind.String;
-        var bytes = string.IsNullOrEmpty(data.RawValueBase64) ? [] : Convert.FromBase64String(data.RawValueBase64);
 
         switch (kind)
         {
             case RegistryValueKind.Binary:
+                var bytes = data.BinaryValue ?? (string.IsNullOrEmpty(data.RawValueBase64) ? [] : Convert.FromBase64String(data.RawValueBase64));
                 key.SetValue(data.ValueName, bytes, RegistryValueKind.Binary);
                 break;
             case RegistryValueKind.DWord:
-                var dword = bytes.Length >= 4 ? BitConverter.ToInt32(bytes, 0) : int.Parse(data.StringValue);
+                var dword = data.DWordValue ?? (int.TryParse(data.StringValue, out var dw) ? dw : 0);
                 key.SetValue(data.ValueName, dword, RegistryValueKind.DWord);
                 break;
             case RegistryValueKind.QWord:
-                var qword = bytes.Length >= 8 ? BitConverter.ToInt64(bytes, 0) : long.Parse(data.StringValue);
+                var qword = data.QWordValue ?? (long.TryParse(data.StringValue, out var qw) ? qw : 0L);
                 key.SetValue(data.ValueName, qword, RegistryValueKind.QWord);
                 break;
             case RegistryValueKind.MultiString:
-                var multi = data.StringValue.Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries);
+                var multi = data.MultiStringValue ?? data.StringValue?.Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries) ?? [];
                 key.SetValue(data.ValueName, multi, RegistryValueKind.MultiString);
                 break;
             case RegistryValueKind.ExpandString:
-                key.SetValue(data.ValueName, data.StringValue, RegistryValueKind.ExpandString);
+                key.SetValue(data.ValueName, data.StringValue ?? "", RegistryValueKind.ExpandString);
                 break;
             default:
-                key.SetValue(data.ValueName, data.StringValue, RegistryValueKind.String);
+                key.SetValue(data.ValueName, data.StringValue ?? "", RegistryValueKind.String);
                 break;
         }
     }
@@ -210,21 +234,28 @@ public static class QuarantineService
         if (key is null) return;
 
         var current = Convert.ToString(key.GetValue(data.ValueName, "", RegistryValueOptions.DoNotExpandEnvironmentNames)) ?? "";
-        var merged = MergePathSegment(current, data.RemovedSegment);
+        var merged = MergePathSegment(current, data.RemovedSegment, data.OriginalIndex);
         if (!merged.Equals(current, StringComparison.Ordinal))
         {
             key.SetValue(data.ValueName, merged, key.GetValueKind(data.ValueName));
         }
     }
 
-    public static string MergePathSegment(string currentPath, string segmentToRestore)
+    public static string MergePathSegment(string currentPath, string segmentToRestore, int originalIndex = -1)
     {
         if (string.IsNullOrWhiteSpace(segmentToRestore)) return currentPath;
         var segments = currentPath.Split(';', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries).ToList();
         if (segments.Any(s => s.Equals(segmentToRestore, StringComparison.OrdinalIgnoreCase)))
             return currentPath;
 
-        segments.Add(segmentToRestore);
+        if (originalIndex >= 0 && originalIndex <= segments.Count)
+        {
+            segments.Insert(originalIndex, segmentToRestore);
+        }
+        else
+        {
+            segments.Add(segmentToRestore);
+        }
         return string.Join(';', segments);
     }
 
@@ -250,13 +281,30 @@ public static class QuarantineService
                 serviceKey.SetValue("ImagePath", serviceData.ImagePath, RegistryValueKind.ExpandString);
                 serviceKey.SetValue("Type", serviceData.ServiceType, RegistryValueKind.DWord);
                 serviceKey.SetValue("Start", serviceData.StartType, RegistryValueKind.DWord);
+                serviceKey.SetValue("ErrorControl", serviceData.ErrorControl, RegistryValueKind.DWord);
+
+                if (!string.IsNullOrEmpty(serviceData.ServiceAccount))
+                    serviceKey.SetValue("ObjectName", serviceData.ServiceAccount, RegistryValueKind.String);
+
+                if (serviceData.Dependencies.Length > 0)
+                    serviceKey.SetValue("DependOnService", serviceData.Dependencies, RegistryValueKind.MultiString);
+
+                if (serviceData.DelayedAutoStart)
+                    serviceKey.SetValue("DelayedAutoStart", 1, RegistryValueKind.DWord);
+
                 if (!string.IsNullOrEmpty(serviceData.Description))
                     serviceKey.SetValue("Description", serviceData.Description, RegistryValueKind.String);
 
-                if (!string.IsNullOrEmpty(serviceData.ServiceDll))
+                if (!string.IsNullOrEmpty(serviceData.ServiceDll) || serviceData.Parameters.Count > 0)
                 {
                     using var paramsKey = serviceKey.CreateSubKey("Parameters");
-                    paramsKey.SetValue("ServiceDll", serviceData.ServiceDll, RegistryValueKind.ExpandString);
+                    if (!string.IsNullOrEmpty(serviceData.ServiceDll))
+                        paramsKey.SetValue("ServiceDll", serviceData.ServiceDll, RegistryValueKind.ExpandString);
+
+                    foreach (var (k, v) in serviceData.Parameters)
+                    {
+                        paramsKey.SetValue(k, v, RegistryValueKind.String);
+                    }
                 }
             }
         }

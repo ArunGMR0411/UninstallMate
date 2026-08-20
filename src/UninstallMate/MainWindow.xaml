@@ -194,7 +194,7 @@
                   CornerRadius="6" Padding="10,8" Margin="0,18,0,0">
             <Grid>
               <TextBlock Text="Version" Foreground="{DynamicResource TextFillColorSecondaryBrush}" />
-              <TextBlock Text="2.0.0-hardened" HorizontalAlignment="Right" FontWeight="SemiBold" />
+              <TextBlock Text="{Binding AppVersionText}" HorizontalAlignment="Right" FontWeight="SemiBold" />
             </Grid>
           </Border>
         </Grid>

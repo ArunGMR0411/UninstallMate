@@ -16,8 +16,31 @@ public enum CleanupKind
     EventLogSource
 }
 
-public enum RiskLevel { Low, Medium, High }
+public enum RiskLevel
+{
+    Low = 0,
+    Medium = 1,
+    High = 2
+}
+
+public static class RiskLevelExtensions
+{
+    public static RiskLevel Highest(RiskLevel a, RiskLevel b)
+        => a >= b ? a : b;
+
+    public static RiskLevel Lowest(RiskLevel a, RiskLevel b)
+        => a <= b ? a : b;
+}
+
 public enum CleanupScope { Application, User, System }
+
+public static class CleanupSelectionPolicy
+{
+    public static bool ShouldAutoSelect(CleanupCandidate candidate)
+        => candidate.AutoSelectable
+           && candidate.Risk == RiskLevel.Low
+           && candidate.Confidence.IsAtLeast(OwnershipConfidence.High);
+}
 
 public sealed class CleanupCandidate : ObservableObject
 {
@@ -37,7 +60,7 @@ public sealed class CleanupCandidate : ObservableObject
     public bool DetectedBeforeUninstall { get; init; }
     public bool DetectedAfterUninstall { get; init; } = true;
     public bool RequiresReboot { get; init; }
-    public bool AutoSelectable { get; init; } = true;
+    public bool AutoSelectable { get; set; } = true;
     public string RegistryValueKindName { get; init; } = "";
     public string RegistryRawValueBase64 { get; init; } = "";
     public CleanupScope Scope { get; init; }
@@ -66,16 +89,11 @@ public sealed class CleanupCandidate : ObservableObject
         _ => "Unknown"
     };
 
-    public string EvidenceSummary => EvidenceList.Count > 0
-        ? string.Join(" | ", EvidenceList)
-        : (string.IsNullOrEmpty(EvidencePath) ? Reason : $"{Reason} (backed by: {EvidencePath})");
-
-    private static string FormatBytes(long bytes)
+    private static string FormatBytes(long bytes) => bytes switch
     {
-        string[] suffix = ["B", "KB", "MB", "GB", "TB"];
-        double value = bytes;
-        var unit = 0;
-        while (value >= 1024 && unit < suffix.Length - 1) { value /= 1024; unit++; }
-        return $"{value:0.#} {suffix[unit]}";
-    }
+        >= 1024 * 1024 * 1024 => $"{bytes / (1024.0 * 1024 * 1024):0.1} GB",
+        >= 1024 * 1024 => $"{bytes / (1024.0 * 1024):0.1} MB",
+        >= 1024 => $"{bytes / 1024.0:0.0} KB",
+        _ => $"{bytes} B"
+    };
 }
